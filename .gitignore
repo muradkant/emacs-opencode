@@ -1,0 +1,11 @@
+# byte-compiled artifacts
+*.elc
+# autoloads
+opencode-hyprland-popup-autoloads.el
+# backup/lock
+*~
+.\#*
+\#*
+# elisp package archives
+*.tar
+*.tar.gz
