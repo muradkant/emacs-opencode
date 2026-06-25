@@ -105,10 +105,13 @@ JSON.  Signals on HTTP/network error."
       (unwind-protect
           (with-current-buffer buf
             (goto-char url-http-end-of-headers)
-            (let ((status (/ url-http-response-status 100)))
+            (let ((status (/ (or url-http-response-status 0) 100)))
               (unless (or (= status 2) (= status 3))
-                (error "HTTP %s %s: status %d"
-                       method path url-http-response-status)))
+                (let ((err-body (buffer-substring-no-properties
+                                 (point) (point-max))))
+                  (error "HTTP %s %s: status %d body=%s"
+                         method path url-http-response-status
+                         (substring err-body 0 (min 400 (length err-body)))))))
             (let ((body (buffer-substring-no-properties (point) (point-max))))
               (if (string-empty-p (string-trim body))
                   nil
@@ -116,11 +119,36 @@ JSON.  Signals on HTTP/network error."
         (kill-buffer buf)))))
 
 (defun oc-hp-session--json-encode (obj)
-  "Encode OBJ to JSON as a UTF-8 string."
-  (let ((json-object-type 'plist)
-        (json-array-type  'list)
-        (json-key-type    'keyword))
-    (encode-coding-string (json-encode obj) 'utf-8)))
+  "Encode OBJ (a plist, possibly nested with plists inside lists) to JSON.
+Uses alists internally because `json-encode' mis-detects nested plists
+inside arrays — `((:type \"text\" :text \"hi\"))' would be encoded as
+an OBJECT rather than an ARRAY of objects (verified live against
+OpenCode 1.17.11 — prompt_async returned 400 with
+`Expected array, got {\"type\":[\"text\",\"text\",...]}`)."
+  (encode-coding-string
+   (let ((json-object-type 'alist)
+         (json-array-type  'list)
+         (json-key-type    'symbol))
+     (json-encode (oc-hp-session--plist->alist obj)))
+   'utf-8))
+
+(defun oc-hp-session--plist->alist (obj)
+  "Recursively convert OBJ's plists to alists (keys become symbols).
+Atoms and alists are preserved.  Lists whose elements are plists or
+objects have each element converted."
+  (cond
+   ((and (consp obj) (keywordp (car obj)))
+    ;; a plist — convert to alist
+    (let (out)
+      (while (and (consp obj) (keywordp (car obj)))
+        (push (cons (intern (substring (symbol-name (car obj)) 1))
+                    (oc-hp-session--plist->alist (cadr obj)))
+              out)
+        (setq obj (cddr obj)))
+      (nreverse out)))
+   ((consp obj)
+    (mapcar #'oc-hp-session--plist->alist obj))
+   (t obj)))
 
 (defun oc-hp-session--json-parse (string)
   "Parse STRING into a plist; fall back to the raw string if not JSON."
@@ -161,11 +189,14 @@ Returns the created session plist."
       '()))
 
 (defun oc-hp-session-prompt-async (session-id prompt &optional directory)
-  "Send PROMPT to SESSION-ID via `prompt_async' (fire-and-forget, 204).
-Returns non-nil on a successful response (no body expected)."
+  "Send PROMPT (a string) to SESSION-ID as a new turn via `prompt_async'.
+Body shape verified against OpenCode v1.17.11 source:
+`{parts:[{type:\"text\", text:<prompt>}]}' (RESEARCH §13.1).
+Returns non-nil on 204.  No body returned."
   (oc-hp-session--request "POST"
                           (format "/session/%s/prompt_async" session-id)
-                          (list :prompt prompt) directory)
+                          (list :parts (list (list :type "text" :text prompt)))
+                          directory)
   t)
 
 (defun oc-hp-session-abort (session-id &optional directory)
@@ -174,14 +205,17 @@ Returns non-nil on a successful response (no body expected)."
                           (format "/session/%s/abort" session-id)
                           nil directory))
 
-(defun oc-hp-session-reply-permission (session-id permission-id allow
+(defun oc-hp-session-reply-permission (session-id permission-id response
                                       &optional directory)
-  "Reply to a permission ask: ALLOW (bool) for PERMISSION-ID in SESSION-ID.
-Phase 7 calls this after a `y-or-n-p' in the popup's minibuffer."
+  "Reply to a permission ask: RESPONSE for PERMISSION-ID in SESSION-ID.
+RESPONSE is one of the strings `once', `always', `reject' (the
+PermissionV1.Reply literals — RESEARCH §13.2).  Phase 7 calls this after
+a `y-or-n-p' in the popup's minibuffer, defaulting `once' on yes and
+`reject' on no."
   (oc-hp-session--request "POST"
                           (format "/session/%s/permissions/%s"
                                   session-id permission-id)
-                          (list :allow (if allow t :json-false))
+                          (list :response response)
                           directory)
   t)
 
@@ -198,12 +232,23 @@ Phase 7 calls this after a `y-or-n-p' in the popup's minibuffer."
    :initial-value nil))
 
 (defun oc-hp-session--updated-time (session)
-  "Return the updated time of SESSION as an Emacs time value, or nil."
+  "Return the updated time of SESSION as seconds since epoch (float), or nil.
+Handles OpenCode's `time.updated' shapes observed live in 1.17.11:
+epoch *milliseconds* (a large number), epoch seconds, or an ISO-8601 string."
   (let* ((time (plist-get session :time))
          (updated (or (and time (plist-get time :updated))
                       (plist-get session :updatedAt)
                       (plist-get session :updated))))
-    (and updated (encode-time (parse-time-string updated)))))
+    (cond
+     ((null updated) nil)
+     ((numberp updated)
+      ;; heuristic: > year 2001 in ms => milliseconds
+      (if (> updated 1000000000000) (/ updated 1000.0) (float updated)))
+     ((stringp updated)
+      (condition-case nil
+          (float-time (encode-time (parse-time-string updated)))
+        (error nil)))
+     (t nil))))
 
 (defun oc-hp-session-title (session)
   "Return SESSION's title, falling back to its id."
@@ -211,6 +256,19 @@ Phase 7 calls this after a `y-or-n-p' in the popup's minibuffer."
       (plist-get session :slug)
       (plist-get session :id)
       "(untitled)"))
+
+(defun oc-hp-session--status-type (status-event)
+  "From a `session.status' event plist, return status.type (a string) or nil."
+  (let ((status (plist-get (plist-get status-event :properties) :status)))
+    (and (listp status) (plist-get status :type))))
+
+(defun oc-hp-session--touched-files-from-step-ended (step-event)
+  "Return the list of touched relative paths from a `session.next.step.ended'.
+Per RESEARCH §13.4: the event's `properties.files' is the
+server-authoritative list of files changed during the step.  Returns nil
+if no files were touched."
+  (let ((props (plist-get step-event :properties)))
+    (append (plist-get props :files) nil)))
 
 (provide 'opencode-hyprland-popup-session)
 ;;; opencode-hyprland-popup-session.el ends here

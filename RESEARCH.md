@@ -344,7 +344,124 @@ can verify it even before any of the UX exists.
 
 ---
 
-## 12. Decisions (resolved 2026-06-25)
+## 13. Corrigenda verified against OpenCode v1.17.11 source (2026-06-25)
+
+Cloned `https://github.com/sst/opencode` at tag `v1.17.11` and read the
+canonical schema + route source. **The brief's API/event claims were
+partly wrong**; these supersede them:
+
+### 13.1 `POST /session/:id/prompt_async` body — NOT `{prompt:"..."}`
+- File: `packages/schema/src/session-v1.ts:397` (`TextPartInput`)
+  and `packages/opencode/src/server/routes/instance/httpapi/handlers/session.ts:309` (`promptAsync`).
+- Body schema: `{ parts: Array<TextPartInput|FilePartInput|AgentPartInput|SubtaskPartInput>, ...optional }`;
+  `parts` is **required**. `TextPartInput = { type:"text", text:string, id?, synthetic?, ignored?, time?, metadata? }`.
+- So the correct minimal body is `{"parts":[{"type":"text","text":"<prompt>"}]}`.
+  Sending `{"prompt":"..."}` → **HTTP 400** (verified live). The brief §4
+  said "POST /session/:id/prompt_async" but didn't specify the body; my
+  Phase 3 first draft used `{:prompt prompt}` and the live test caught it.
+  Phase 3's `oc-hp-session-prompt-async` was corrected to build the
+  `{:parts ((:type "text" :text prompt))}` envelope.
+- Confirmed response is **204 No Content** (`HttpApiSchema.NoContent.make()`,
+  handler line 326) — matches brief §4.
+
+### 13.2 Permission reply body — NOT `{allow:bool}`
+- File: `packages/opencode/src/server/routes/instance/httpapi/groups/session.ts:74`
+  (`PermissionResponsePayload = {response: PermissionV1.Reply}`) and
+  `packages/schema/src/permission-v1.ts:38` (`Reply = Literals(["once","always","reject"])`).
+- Endpoint: `POST /session/:id/permissions/:permissionID` (path matches brief).
+- Body: `{"response":"once"|"always"|"reject"}`. A `y-or-n-p` should map
+  **yes→"once"** (allow this once) or "always" (if we want to persist),
+  **no→"reject"**. Phase 7 will default to "once"/"reject" and expose
+  `always` via prefix-arg, since "always" modifies persistent rules
+  (a soft philosophy violation — see §2; we'll keep "always" optional).
+
+### 13.3 Turn-complete signal is `session.status` with `status.type=="idle"`
+- File: `packages/schema/src/session-status-event.ts:8-40`.
+  `session.status` shape: `{ sessionID, status: {type:"idle"|"busy"|"retry", ...} }`.
+  `session.idle` is **deprecated** (comment line 42). Phase 5 must key on
+  `session.status` + `status.type=="idle"`, NOT the deprecated `session.idle`.
+  Our SSE module's `oc-hp-sse-session-status-hook` is correct; the idle
+  hook is kept only for forward-compat.
+
+### 13.4 v2 session.next.* event taxonomy — full source list
+- File: `packages/schema/src/session-event.ts` (read in full, 519 lines).
+  Full v2 set, useful ones confirmed:
+  - `session.next.text.{started,delta,ended}` — `ended` has full `text:string`; deltas are live-only (no version).
+  - `session.next.reasoning.{started,delta,ended}` — `ended` has full `text:string`.
+  - `session.next.tool.called` — `{tool, input, provider}` (name+args, no result). ✓ matches brief.
+  - `session.next.tool.input.{started,delta,ended}` — streaming tool args (live-only for delta).
+  - `session.next.tool.{success,failed,progress}` — results (we DROP these for display, per brief).
+  - `session.next.step.{started,ended,failed}` — `ended` has `finish, cost, tokens, snapshot?, files?: RelativePath[]` ← **Phase 8 source for touched files**. `failed` has `error`.
+  - `session.next.{prompted, prompt.admitted, context.updated, synthetic}` — prompt lifecycle.
+  - `session.next.{agent.switched, model.switched, moved, retried, compaction.*, revert.*}` — auxiliary.
+- The brief §4 list was accurate for the events we render; this audit
+  adds `session.next.step.ended.files` as the file-revert trigger (the
+  brief §3/§8 spoke of tracking via `session.next.tool.called`'s
+  `input.filePath`, but `step.ended.files: RelativePath[]` is the
+  server-authoritative list per turn — **switch Phase 8 to use it**).
+- v1 (`message.part.*`) events live in `session-v1.ts`; the brief's
+  "prefer v2 over v1" is right. Our SSE filter dispatches by the JSON
+  `type` field, so both pass through; Phase 5 will register *v2* handlers.
+
+### 13.5 SSE payload envelope
+- Live-confirmed (Phase 1 test): the server wraps events as
+  `data: {"payload":{"id":"evt_...","type":"...","properties":{...}}}` with
+  bare `data:` lines (no `event:` field on the wire). Our SSE parser
+  correctly resolves the type from `payload.type` and properties from
+  `payload.properties` (instance envelope `{type, properties}` is the
+  inner payload). This matches report §6b's "two envelope shapes" claim.
+
+### 13.7 ⚠ LIVE 1.17.11 EMITS V1 `message.part.*` EVENTS, NOT v2 `session.next.*`
+
+**This is the single biggest finding** from the live end-to-end send and
+supersedes RESEARCH §13.4 / the brief §4. We sent a real prompt to the
+installed server and observed its SSE stream verbatim:
+
+- The server emits **v1** events: `message.part.updated`, `message.part.delta`,
+  `message.updated`, `session.updated`, `session.status`, `session.idle`,
+  `session.diff`, `project.updated`. **None** of the v2 `session.next.*`
+  types fired on 1.17.11. The brief's "Prefer v2 over v1" is correct as a
+  schema-reader intuition but **wrong for what this version actually
+  streams** — v2 is on `dev` HEAD; v1.17.11 still emits v1.
+- **V1 event shapes verified live** (this is the data model Phase 5 wires):
+  - `message.part.updated` → `{:sessionID, :part <part-obj>, :time <ms>}`
+  - `message.part.delta`    → `{:sessionID, :messageID, :partID, :field "text", :delta "<chunk>"}`
+  - `session.status`        → `{:sessionID, :status {:type "busy"|"idle"|"retry", ...}}`
+  - `session.idle`          → `{:sessionID}` (deprecated; still fires in 1.17.11)
+- **Part `:type` values observed** in a no-tool turn: `step-start`,
+  `text`, `step-finish`. (Source `session-v1.ts` and the rendered message
+  list confirm additional types: `reasoning`, `tool`, `file`.) So Phase 5
+  dispatches by `part.type`, not by event name.
+  - `step-start`: `:snapshot` (workspace-hash)
+  - `text`: `:text` (the answer chunk — empty on first appearance, grows;
+    has `:time.end` when complete)
+  - `step-finish`: `:reason "stop"`, `:cost`, `:tokens`, `:snapshot`
+  - `tool` (per source): `:tool`, `:input`, plus result on later updates
+- **`session.status` `:busy` fires several times**; the turn is complete
+  only when `:idle` arrives (or `session.idle`). Phase 5 keystones on `idle`.
+- **`/session/:id/message`** returns message plists with `:role` (=nil
+  in our test — likely a quirk of the response shape — and `:parts` =
+  a list of part plists identical to the streaming ones).
+
+**Implication for Phase 5:** register handlers on
+`oc-hp-sse-message-part-updated-hook` (already wired in Phase 1 SSE) and
+on `oc-hp-sse-session-status-hook`. The `message.part.delta` SSE event
+type IS already mapped to `oc-hp-sse-message-part-updated-hook` in our
+module — handlers branch on `(plist-get event :type)` to distinguish
+`.updated` vs `.delta`.
+
+The v2 hooks (`oc-hp-sse-session-next-*`) added in Phase 1 remain wired
+for forward-compatibility (dev branch emitted these) but Phase 5 does
+NOT depend on them for 1.17.11. If/when the user upgrades to a v2-emitting
+version, Phase 5 only needs to register the v2 handlers alongside — the
+buffer-mutation machinery is event-shape-agnostic.
+- Live OpenAPI spec at `http://<host>:port>/doc` (verified). Top-level
+  path prefixes in the spec: `/session`, `/session/status`, plus
+  `/api/session/...` (newer effect HttpApi namespace). The **path used
+  by brief §4 and Phase 3** — `/session/:id/...` — is the canonical
+  public one; the `/api/...` paths are the newer namespace sharing
+  `:sessionID` parameter naming. We use `/session/:id/...` (matches
+  what the official SDK is moving to and what's in brief).
 
 1. **Session scope** → user will `git init` each project dir (e.g.
    `~/Projects/Emacs-oc`), so OpenCode's native worktree-root scope then
