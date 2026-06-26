@@ -507,3 +507,44 @@ the guard and window-rule must be title-based); (3) Hyprland class is
 Plus a strategy choice: vendor `karta0807913/opencode.el`'s transport
 modules (my lean) vs depend on it vs reimplement. Reply to §10 and I'll
 write Phase 1.
+---
+
+## 14. Phase 9 + 10 verification (2026-06-26, batch, no quota)
+
+### 14.1 Phase 9 — follow-up prompt extraction + buffer wipe
+Implemented in `opencode-hyprland-popup-display.el` (`oc-hp-display--finalize`
+anchors `oc-hp-popup-answer-end` at the end of the finalized answer) and
+`opencode-hyprland-popup.el` (`oc-hp-popup--current-prompt-text` branches on
+`oc-hp-popup-phase`; `oc-hp-popup-send` wipes to `[prompt2]` before reopening
+the divider and refuses sends while phase 1). Verified live in `--batch` by
+`oc-hp-phase9-test.el`: 9/9 checks pass — turn1 finalizes with the answer-end
+marker set, a follow-up `:w` extracts ONLY `prompt2` (text after the marker),
+the buffer wipes to `[prompt2]`, phase resets to 0, a first turn returns the
+whole buffer, and a phase-1 send is refused.
+
+### 14.2 Phase 10 — buffer pool (bury, don't kill)
+Already correct from Phase 4 (`oc-hp-popup-quit` buries; `--ensure-buffer`
+reuses via `--live-buffer` then `get-buffer-create`). Confirmed no code change
+was needed. `oc-hp-phase10-test.el`: 7/7 checks pass — reuse-same-id → `eq`
+buffer; distinct ids → distinct coexisting buffers; `quit` keeps the buffer
+live (buried, not killed); re-open after quit reuses the SAME buried buffer
+and its preserved content. Multiple session popup buffers coexist in the pool
+(one `*opencode-prompt<ses_id>*` per session), so a prefix-arg picker swap
+leaves the original session's buffer buried-but-alive ready to re-open.
+
+### 14.3 Batch transport smoke test (Phases 1-3 regression)
+`oc-hp-smoke.el` spawns a real `opencode serve` (Phase 2), connects the
+`/global/event` SSE stream (Phase 1), and confirms `server.connected` arrives
+within 10s — PASS. The Phase 6/7/8 require-chain loads cleanly. Teardown
+leaves no orphan `opencode serve` / `curl` processes and port 4096 is freed.
+The full byte-compile of all 8 modules stays clean (exit 0, no warnings).
+
+### 14.4 ⚠ The `hyprland` (with `l`) spelling trap
+The package dir and all module / provide symbols are `opencode-hyprland-popup`
+(h-y-p-r-l-a-n-d). The handoff text and one's own retyping reflex both tend to
+silently drop the `l` after `hypr` (`opencode-hyprand-popup`), which then
+`read`/`edit` "File not found" or `find-file` an empty buffer (making
+`check-parens` appear to pass trivially). Confirming the exact bytes from a
+`ls`/`grep` result before every read/edit, and/or cmdbinding a shell var
+(`F=$(ls *.el)`), defeats the trap. It bit this session twice in scratch
+test scripts.
