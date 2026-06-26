@@ -51,9 +51,14 @@ windowrulev2 = size 90 28, title:^(OpenCode Prompt)$
 windowrulev2 = center, title:^(OpenCode Prompt)$
 ```
 
-As a fallback (no config edit, robust against focus races), the package also runs
-`hyprctl dispatch setfloating` on the new frame right after `make-frame`. Disable it with
-`(setq oc-hp-popup-float-on-hyprland nil)`.
+As a fallback (no config edit), the package also floats the new frame right after
+`make-frame` — but it targets that **specific** frame by its Hyprland window
+address (resolved by matching the frame's title via `hyprctl clients -j`), via
+`hyprctl dispatch setfloating address:0x…`. This is deliberate: a bare
+`hyprctl dispatch setfloating` floats the *active* window, and under XWayland the
+new frame's focus/title can lag `make-frame` by a few ms — so the bare form would
+race and float your *original* Emacs window instead of the popup. Disable the
+runtime float with `(setq oc-hp-popup-float-on-hyprland nil)`.
 
 ## Usage
 
@@ -125,7 +130,7 @@ buffer refreshes without a manual `M-x revert-buffer`. Toggle the safety net:
 |---|---|---|
 | `oc-hp-popup-frame-title` | `"OpenCode Prompt"` | Frame title Hyprland matches. |
 | `oc-hp-popup-frame-width` / `-height` | `90` / `28` | Popup frame size (chars/lines). |
-| `oc-hp-popup-float-on-hyprland` | `t` | Run `hyprctl dispatch setfloating` after make-frame. |
+| `oc-hp-popup-float-on-hyprland` | `t` | Float the new frame by its window address (title-resolved) after make-frame. |
 | `oc-hp-popup-default-model` | `nil` | Optional model id for new sessions. |
 | `oc-hp-server-port` | `nil` | `nil` = spawn our own server; a number = attach. |
 | `oc-hp-server-password` | `nil` | Basic-auth password (`OPENCODE_SERVER_PASSWORD`). |
