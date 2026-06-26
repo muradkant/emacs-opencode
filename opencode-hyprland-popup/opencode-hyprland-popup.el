@@ -24,13 +24,18 @@
 ;;      `:w' buffer-locally to send the buffer text to the session via
 ;;      `prompt_async'.  (Display is added in Phase 5.)
 ;;   6. Hyprland floats the new frame imperatively via `hyprctl dispatch
-;;      setfloating' (the user may also add a static title-only rule — see
-;;      RESEARCH.md §3).
+;;      setfloating address:<addr>', where <addr> is resolved by matching
+;;      the frame's title against `hyprctl clients -j' (the user may also
+;;      add a static title-only rule — see RESEARCH.md §3).  Address-
+;;      targeting (NOT bare `setfloating', which floats the active window)
+;;      avoids the focus race where the *original* Emacs window gets
+;;      floated instead of the popup.
 
 ;;; Code:
 
 (require 'cl-lib)
 (require 'subr-x)
+(require 'json)
 (require 'evil nil t)                        ; soft require — popup needs it
 
 (require 'opencode-hyprland-popup-server)
@@ -62,7 +67,8 @@
   :group 'opencode-hyprland-popup)
 
 (defcustom oc-hp-popup-float-on-hyprland t
-  "If non-nil, imperatively run `hyprctl dispatch setfloating' after make-frame."
+  "If non-nil, float the new frame via `hyprctl dispatch setfloating'
+address-targeted to that frame's window (resolved by title)."
   :type 'boolean
   :group 'opencode-hyprland-popup)
 
@@ -249,17 +255,80 @@ Trimmed on both ends so a leading/trailing blank the user left is ignored."
 (defun oc-hp-popup--hyprland-float (frame)
   "Imperatively float FRAME on Hyprland if running under XWayland.
 Guarded so the no-op path is taken on pgtk / terminal Emacs (per
-RESEARCH §2 the build here is `window-system = x')."
+RESEARCH §2 the build here is `window-system = x').
+
+We float FRAME by its specific Hyprland window address — resolved by
+matching the frame's title against `hyprctl clients -j' — NOT by the
+\"active\" window.  Bare `hyprctl dispatch setfloating' (the old code)
+operates on whatever Hyprland considers active at dispatch time; under
+XWayland the new frame's title/focus can lag make-frame by a few ms,
+so the dispatch would race and float the *original* Emacs window
+instead of the popup.  Address-targeting is deterministic and
+focus-independent, so the wrong window can never be floated.
+
+Emacs's `outer-window-id' frame parameter is the X11 window id, which
+is a *different* namespace from Hyprland's internal address —
+`hyprctl clients' exposes no X11-id field, only address/pid/class/title
+— so title resolution is the correct (and robust) bridge."
   (when (and oc-hp-popup-float-on-hyprland
              (eq window-system 'x)
              (executable-find "hyprctl"))
     (select-frame frame)
-    (let ((default-directory (or default-directory "~/")))
+    (let ((default-directory (or default-directory "~/"))
+          (title oc-hp-popup-frame-title))
       (condition-case err
-          (call-process "hyprctl" nil 0 nil "dispatch" "setfloating")
+          (let ((address (oc-hp-popup--hyprland-address-for-title title)))
+            (cond
+             (address
+              (call-process "hyprctl" nil 0 nil
+                            "dispatch" "setfloating"
+                            (concat "address:" address)))
+             (t
+              ;; Title not yet seen by the compositor (XWayland title lag).
+              ;; Bail out rather than fall back to the active window — that
+              ;; fallback is exactly the focus race this function exists to
+              ;; avoid.  The user's static title-only windowrule still floats it.
+              (message "opencode popup: hyprctl float skipped: no window \
+matched title %S (it may appear shortly)" title))))
         (error
          (message "opencode popup: hyprctl float failed: %s"
                   (error-message-string err)))))))
+
+(defun oc-hp-popup--hyprland-address-for-title (title)
+  "Return the Hyprland window address whose title is TITLE, or nil.
+Reads `hyprctl clients -j' and matches the `title' field exactly.
+Returns nil if no client matches (e.g. the new frame's title hasn't
+propagated yet) or if the compositor output is unparseable — both are
+handled gracefully by the caller rather than falling back to the
+focus-race-prone active-window dispatch."
+  (condition-case err
+      (with-temp-buffer
+        (when (zerop (call-process "hyprctl" nil t nil "clients" "-j"))
+          (goto-char (point-min))
+          (let ((clients (oc-hp-popup--json-parse-plist-array
+                          (buffer-string))))
+            (and (listp clients)
+                 (cl-some (lambda (c)
+                            (and (equal (plist-get c :title) title)
+                                 (plist-get c :address)))
+                          clients)))))
+    (error
+     (message "opencode popup: hyprctl clients parse failed: %s"
+              (error-message-string err))
+     nil)))
+
+(defun oc-hp-popup--json-parse-plist-array (string)
+  "Parse STRING (the JSON from `hyprctl clients -j') into a list of plists.
+Mirrors `oc-hp-session--json-parse' (json-object-type plist,
+json-array-type list, json-key-type keyword); returns the raw string
+on parse failure so the caller's `listp' guard rejects it cleanly."
+  (let ((json-object-type 'plist)
+        (json-array-type  'list)
+        (json-key-type    'keyword)
+        (json-null        nil))
+    (condition-case _err
+        (json-read-from-string string)
+      (error string))))
 
 ;;; --- Entrypoint ---
 
