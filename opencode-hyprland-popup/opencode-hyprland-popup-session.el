@@ -71,15 +71,26 @@ Resolution order:
      (t (directory-file-name dir)))))
 
 (defun oc-hp-session--git-toplevel (dir)
-  "Return the git worktree root containing DIR, or nil."
+  "Return the git worktree root containing DIR, or nil.
+Uses a dedicated temp buffer for `call-process' output rather than
+`with-output-to-string' + an inner `let ((standard-output (current-buffer)))'
+— that latter pattern returns nil on Emacs 30 (the inner `let' rebinds
+standard-output to the *current* buffer, but `with-output-to-string' has
+already switched to a fresh output buffer, so `call-process' writes to the
+wrong place and we capture nothing).  Verified live by reproducing three
+variants; only the dedicated-buffer form returns the toplevel correctly."
   (let ((default-directory dir))
     (condition-case _err
-        (let ((out (string-trim
-                    (with-output-to-string
-                      (let ((standard-output (current-buffer)))
-                        (call-process "git" nil t nil
-                                      "rev-parse" "--show-toplevel"))))))
-          (unless (string-empty-p out) out))
+        (let* ((buf (generate-new-buffer " *oc-hp-git*"))
+               (status (call-process "git" nil buf nil
+                                      "rev-parse" "--show-toplevel"))
+               (out (with-current-buffer buf
+                      (string-trim
+                       (buffer-substring-no-properties
+                        (point-min) (point-max))))))
+          (kill-buffer buf)
+          (when (and (equal status 0) (not (string-empty-p out)))
+            out))
       (error nil))))
 
 ;;; --- Sync HTTP core ---
