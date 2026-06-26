@@ -37,6 +37,9 @@
 (require 'opencode-hyprland-popup-session)
 (require 'opencode-hyprland-popup-sse)
 (require 'opencode-hyprland-popup-display)
+(require 'opencode-hyprland-popup-picker)
+(require 'opencode-hyprland-popup-permission)
+(require 'opencode-hyprland-popup-revert)
 
 (defgroup opencode-hyprland-popup nil
   "OpenCode Hyprland popup frontend."
@@ -136,7 +139,9 @@ so without the copy the override would leak into every other buffer."
     (oc-hp-server-start))
   (unless (oc-hp-sse-connected-p)
     (oc-hp-sse-connect (oc-hp-server-url "/global/event")
-                       (oc-hp-server-auth-headers))))
+                       (oc-hp-server-auth-headers)))
+  (oc-hp-permission-attach)              ; Phase 7: register permission.asked
+  (oc-hp-revert-attach))                 ; Phase 8: reverts touched buffers
 
 ;;; --- Session selection (default path) ---
 
@@ -237,17 +242,26 @@ RESEARCH §2 the build here is `window-system = x')."
 ;;;###autoload
 (defun opencode-hyprland-popup-prompt (&optional arg)
   "Open a floating OpenCode popup for the current project.
-With prefix ARG, show a session picker (Phase 6 — falls back to default
-behaviour if not yet wired).  Otherwise: continue the most-recent session
-for the project, or create a new one."
+With prefix ARG, show a session picker for this project; otherwise
+continue the most-recent session for the project (or create one)."
   (interactive "P")
-  (ignore arg)
   (oc-hp-popup--ensure-backend)
   (let* ((directory (oc-hp-session-find-directory))
-         (session-id (or (oc-hp-popup--pick-session directory)
-                         (error "OpenCode: could not pick or create a session")))
-         (buf (oc-hp-popup--ensure-buffer session-id directory)))
-    (oc-hp-popup--pop buf)))
+         (session-id
+          (if arg
+              (oc-hp-popup--pick-session-with-picker directory)
+            (or (oc-hp-popup--pick-session directory)
+                (error "OpenCode: could not pick or create a session")))))
+    (unless session-id
+      (user-error "OpenCode: no session selected"))
+    (let ((buf (oc-hp-popup--ensure-buffer session-id directory)))
+      (oc-hp-popup--pop buf))))
+
+(defun oc-hp-popup--pick-session-with-picker (directory)
+  "Show the session picker for DIRECTORY; return the chosen session id."
+  (let* ((sessions (oc-hp-session-list directory))
+         (chosen (oc-hp-picker-select sessions directory)))
+    (and chosen (plist-get chosen :id))))
 
 (defun oc-hp-popup--ensure-buffer (session-id directory)
   "Return a live popup buffer for SESSION-ID, creating or resurrecting it."
