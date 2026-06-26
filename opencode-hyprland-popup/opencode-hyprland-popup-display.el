@@ -313,7 +313,12 @@ the user's prompt text MUST already be in the buffer above point."
           (setq-local oc-hp-display--finalized t)
           (setq-local oc-hp-popup-phase 2)
           (goto-char (point-max))
-          (insert "\n")))))
+          (insert "\n")
+          ;; Phase 9: anchor so the next :w extracts ONLY the follow-up
+          ;; prompt typed below this answer (buffer[answer-end..point-max]).
+          ;; insertion-type nil keeps the marker pinned at the end of the
+          ;; finalized region while the user types the new prompt after it.
+          (setq-local oc-hp-popup-answer-end (copy-marker (point) nil))))))
   ;; notify user visually
   (message "OpenCode: turn complete"))
 

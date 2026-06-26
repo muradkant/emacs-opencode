@@ -159,30 +159,54 @@ This is the Phase-4 default; the prefix-arg session picker is Phase 6."
 
 (defun oc-hp-popup-send (&optional _bang)
   "Send the editable prompt text in this popup as a new turn to OpenCode.
-For Phase 4 this just fires `prompt_async' and reports a message; the live
-three-phase display is added in Phase 5."
+First turn (phase 0): the whole buffer is the prompt.  Follow-up turn
+(phase 2): ONLY prompt2 — the text typed below the last finished answer —
+is sent; the buffer is then wiped to [prompt2] before the Phase 5 divider
+opens, so the new turn shows [prompt2] then [answer2] (brief §1.6).
+Phase 1 (a turn still streaming) is refused to protect the display FSM."
   (interactive "P")
+  (when (eq oc-hp-popup-phase 1)
+    (user-error "OpenCode: a turn is still in progress; wait for it to finish"))
   (let* ((session-id oc-hp-popup-session-id)
          (directory oc-hp-popup-directory)
+         (follow-up-p (eq oc-hp-popup-phase 2))
          (prompt (string-trim-right (oc-hp-popup--current-prompt-text))))
     (unless (and session-id directory)
       (user-error "Popup buffer has no session/directory attached"))
     (when (string-empty-p prompt)
       (user-error "Prompt is empty"))
     (oc-hp-popup--ensure-backend)
+    (when follow-up-p
+      ;; Phase 9: wipe to [prompt2] so Phase 5's divider opens above only
+      ;; the new prompt (not [answer1 + prompt2]).  erase-buffer repoints
+      ;; every marker to point-min; on-send re-creates the eph markers and
+      ;; finalize re-anchors oc-hp-popup-answer-end for this turn.
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (insert prompt)
+        (setq-local oc-hp-popup-phase 0)))
     (condition-case err
         (progn
           (oc-hp-display--on-send)         ; open ephemeral region + prep SSE handlers (Phase 5)
           (oc-hp-session-prompt-async session-id prompt directory)
-          (message "OpenCode: prompt sent to session %s" session-id))
+          (message "OpenCode: prompt sent to session %s%s"
+                   session-id (if follow-up-p " (follow-up)" "")))
       (error
        (message "OpenCode: send failed: %s" (error-message-string err))))))
 
 (defun oc-hp-popup--current-prompt-text ()
   "Return the current editable prompt text in the popup buffer.
-For Phase 4 + initial `:w' this is the entire buffer; Phase 9 narrows to
-the text after the last answer marker for follow-up turns."
-  (buffer-substring-no-properties (point-min) (point-max)))
+First turn (phase 0): the whole buffer is the prompt.
+Follow-up turn (phase 2): ONLY the text typed after the last finished
+answer — i.e. buffer[oc-hp-popup-answer-end .. point-max] — so the
+prior answer is never re-sent (OpenCode holds prompt1+answer1 server-side).
+Trimmed on both ends so a leading/trailing blank the user left is ignored."
+  (if (eq oc-hp-popup-phase 2)
+      (let* ((end (or (marker-position oc-hp-popup-answer-end) (point-min)))
+             (start (min end (point-max))))
+        (string-trim
+         (buffer-substring-no-properties start (point-max))))
+    (buffer-substring-no-properties (point-min) (point-max))))
 
 ;;; --- Dismiss / quit ---
 
