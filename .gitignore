@@ -9,3 +9,5 @@ opencode-hyprland-popup-autoloads.el
 # elisp package archives
 *.tar
 *.tar.gz
+# opencode runtime marker (records the most-recent session id for resume)
+opencode-session
