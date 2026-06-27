@@ -3,7 +3,7 @@
 An Emacs frontend (popup-frame UX) for [OpenCode](https://opencode.ai) (v1.17.11+),
 tuned for Hyprland. OpenCode is used purely as a backend; this package adds only the
 UX layer — a floating frame where you write a prompt with Evil `:w` and watch a live
-three-phase streaming display. See `RESEARCH.md` (repo root) for the design audit.
+three-phase streaming display.
 
 ## Philosophy
 
@@ -70,7 +70,7 @@ runtime float with `(setq oc-hp-popup-float-on-hyprland nil)`.
   credentials are reflected instead of hardcoded model names.
 - `C-u M-x opencode-hyprland-popup-prompt` — create a new session immediately.
   The picker uses `completing-read`; annotations render under vertico+marginalia,
-  and under plain IDO they’re hidden (graceful).
+  and under plain IDO they're hidden (graceful).
 - Write your prompt in the frame. With evil, `:w` SENDS the prompt as a new turn.
   Without evil, `C-c C-c` also sends.
 - `C-c h` toggles the popup frame itself. From inside the popup it hides the frame
@@ -102,8 +102,8 @@ NOT the stacked `[q1 a1 q2 a2]`.
 OpenCode scopes sessions to the git worktree root (`git rev-parse --show-toplevel`), with
 per-request override via the `x-opencode-directory` header (this package threads the
 resolved directory through every request). If your home directory is itself a git repo,
-`git init` each project dir so its worktree root becomes the project (recommended — see
-RESEARCH §5). A single long-lived server then serves multiple projects.
+`git init` each project dir so its worktree root becomes the project (recommended). A
+single long-lived server then serves multiple projects.
 
 ## Permissions (Phase 7)
 
@@ -111,7 +111,7 @@ When OpenCode's turn hits a per-tool `ask` rule, the package surfaces a `y-or-n-
 POPUP FRAME'S OWN MINIBUFFER (the reason the frame is built with `(minibuffer . t)`):
 - `y` → approve once; `C-u y` → approve always (persists the rule);
 - `n` → reject (the turn aborts).
-The reply is POSTed as `{"response":"once"|"always"|"reject"}` (verified RESEARCH §13.2).
+The reply is POSTed as `{"response":"once"|"always"|"reject"}`.
 
 To make OpenCode ASK for a tool, add a permission rule to your project
 `./opencode.json` (or `~/.config/opencode/opencode.jsonc`):
@@ -125,7 +125,7 @@ To make OpenCode ASK for a tool, add a permission rule to your project
 When OpenCode's `write`/`edit`/`bash`/… tools modify files on disk, the package collects
 candidate paths from `tool` parts as they stream, and after the turn finalizes
 (`session.status` `idle`) it reverts every live Emacs buffer visiting a touched path. With
-`global-auto-revert-mode` on this is a harmless no-op; with it off, it’s the only way the
+`global-auto-revert-mode` on this is a harmless no-op; with it off, it's the only way the
 buffer refreshes without a manual `M-x revert-buffer`. Toggle the safety net:
 
 ```elisp
@@ -160,14 +160,14 @@ It runs three bundled batch suites — a real-`opencode serve` transport smoke t
 (Phases 1-3), the Phase 9 follow-up FSM, and the Phase 10 buffer-pool tests. The
 interactive scenarios (`M-x oc-hp-test-phase5-streaming`, …`-phase9-two-turn`) open the
 popup and print acceptance steps to `*Messages*`; they need your real Emacs + display + a
-little LLM quota. See the harness file for each scenario’s setup.
+little LLM quota. See the harness file for each scenario's setup.
 
 ## Notes & gotchas
 
 - The package directory and every module/provide symbol is `opencode-hyprland-popup`
   (with an **L** after `hypr`: `h-y-p-r-l-a-n-d`). Several hand-off notes drop the `L`
-  (`opencode-hyprand-popup` — no `L` after `hypr`), which silently fails file lookups (RESEARCH §14.4).
+  (`opencode-hyprand-popup` — no `L` after `hypr`), which silently fails file lookups.
 - The live 1.17.11 server emits **v1** `message.part.*` events (not the v2
   `session.next.*` the dev branch schema describes); the display dispatches by
-  `part.type` (RESEARCH §13.7). The v2 hooks are wired for forward-compat.
+  `part.type`. The v2 hooks are wired for forward-compat.
 - Targets OpenCode 1.17.11; later versions may move to v2 events / `/api/` paths.
