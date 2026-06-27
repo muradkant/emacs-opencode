@@ -35,6 +35,7 @@
 (require 'subr-x)
 (require 'map)
 (require 'opencode-hyprland-popup-sse)
+(require 'opencode-hyprland-popup-session)
 
 (defgroup oc-hp-display nil
   "Three-phase streaming display for opencode-hyprland-popup."
@@ -84,9 +85,14 @@ concatenate them in insertion order to form the answer.")
 (defvar oc-hp-display--handlers-attached nil
   "Non-nil once we've added the SSE event handlers globally.")
 
+(defvar oc-hp-display--message-role-by-id (make-hash-table :test 'equal)
+  "Cache from OpenCode message id to role string.")
+
 ;;; --- Buffer guard ---
 
 (defvar oc-hp-popup-phase 0
+  "Defined in opencode-hyprland-popup.el; declared here for free-use warnings.")
+(defvar oc-hp-popup-directory nil
   "Defined in opencode-hyprland-popup.el; declared here for free-use warnings.")
 
 (defun oc-hp-display--buffer ()
@@ -151,6 +157,7 @@ the user's prompt text MUST already be in the buffer above point."
 (defun oc-hp-display--attach-handlers ()
   "Attach the v1 event handlers to the SSE hook (idempotent, global)."
   (unless oc-hp-display--handlers-attached
+    (add-hook 'oc-hp-sse-message-updated-hook #'oc-hp-display--handle-message-updated)
     (add-hook 'oc-hp-sse-message-part-updated-hook #'oc-hp-display--handle-part-updated)
     (add-hook 'oc-hp-sse-message-part-updated-hook #'oc-hp-display--handle-part-delta)
     (add-hook 'oc-hp-sse-session-status-hook #'oc-hp-display--handle-status)
@@ -158,10 +165,27 @@ the user's prompt text MUST already be in the buffer above point."
 
 (defun oc-hp-display--detach-handlers ()
   "Detach (for cleanup / test)."
+  (remove-hook 'oc-hp-sse-message-updated-hook #'oc-hp-display--handle-message-updated)
   (remove-hook 'oc-hp-sse-message-part-updated-hook #'oc-hp-display--handle-part-updated)
   (remove-hook 'oc-hp-sse-message-part-updated-hook #'oc-hp-display--handle-part-delta)
   (remove-hook 'oc-hp-sse-session-status-hook #'oc-hp-display--handle-status)
   (setq oc-hp-display--handlers-attached nil))
+
+(defun oc-hp-display--handle-message-updated (event)
+  "Cache message role metadata from a `message.updated' EVENT."
+  (let* ((props (plist-get event :properties))
+         (message (or (plist-get props :message)
+                      (plist-get props :info)
+                      props)))
+    (oc-hp-display--cache-message-role message)))
+
+(defun oc-hp-display--cache-message-role (message)
+  "Record MESSAGE's role by id when both fields are present."
+  (let ((id (or (plist-get message :id)
+                (plist-get message :messageID)))
+        (role (plist-get message :role)))
+    (when (and id role)
+      (puthash id role oc-hp-display--message-role-by-id))))
 
 (defun oc-hp-display--handle-part-updated (event)
   "Record the part structure declared by `message.part.updated' EVENT."
@@ -190,42 +214,72 @@ the user's prompt text MUST already be in the buffer above point."
 
 (defun oc-hp-display--on-part-updated (event)
   "Dispatch on the part type inside EVENT's `:part' object."
-  (let* ((props (plist-get event :properties))
-         (part (plist-get props :part))
-         (type (plist-get part :type))
-         (pid  (plist-get part :id)))
-    (pcase type
-      ("step-start"  nil)            ; boundary; rendering handled by tool/text themselves
-      ("step-finish" nil)            ; finalizer; we render answer cumulatively (cost footer optional)
-      ("text"
-       (let ((text (or (plist-get part :text) "")))
-         (oc-hp-display--record-text pid text)))
-      ("reasoning"
-       (let ((text (or (plist-get part :text) "")))
-         (when (and text (not (string-empty-p text)))
-           (setq-local oc-hp-display--reasoning
-                       (concat oc-hp-display--reasoning text))
-           (oc-hp-display--render-ephemeral))))
-      ("tool"
-       (let* ((name (plist-get part :tool))
-              (input (plist-get part :input))
-              (summary (oc-hp-display--summarize-tool-call name input)))
-         (push (cons pid summary) oc-hp-display--tools)
-         (oc-hp-display--render-ephemeral)))
-      (_ nil))))
+  (when (oc-hp-display--assistant-event-p event)
+    (let* ((props (plist-get event :properties))
+           (part (plist-get props :part))
+           (type (plist-get part :type))
+           (pid  (plist-get part :id)))
+      (pcase type
+        ("step-start"  nil)            ; boundary; rendering handled by tool/text themselves
+        ("step-finish" nil)            ; finalizer; we render answer cumulatively (cost footer optional)
+        ("text"
+         (let ((text (or (plist-get part :text) "")))
+           (oc-hp-display--record-text pid text)))
+        ("reasoning"
+         (let ((text (or (plist-get part :text) "")))
+           (when (and text (not (string-empty-p text)))
+             (setq-local oc-hp-display--reasoning
+                         (concat oc-hp-display--reasoning text))
+             (oc-hp-display--render-ephemeral))))
+        ("tool"
+         (let* ((name (plist-get part :tool))
+                (input (plist-get part :input))
+                (summary (oc-hp-display--summarize-tool-call name input)))
+           (push (cons pid summary) oc-hp-display--tools)
+           (oc-hp-display--render-ephemeral)))
+        (_ nil)))))
 
 (defun oc-hp-display--on-part-delta (event)
   "Append a streaming text delta."
   (let* ((props (plist-get event :properties))
          (pid (plist-get props :partID))
          (delta (plist-get props :delta)))
-    (when (and pid delta
+    (when (and (oc-hp-display--assistant-event-p event)
+               pid delta
                (not (string-empty-p delta))
                (assq pid oc-hp-display--text-by-part))
       ;; Update final-text for the in-progress text part
       (setcdr (assq pid oc-hp-display--text-by-part)
               (concat (cdr (assq pid oc-hp-display--text-by-part)) delta))
       (oc-hp-display--render-ephemeral))))
+
+(defun oc-hp-display--assistant-event-p (event)
+  "Return non-nil when EVENT belongs to an assistant message.
+OpenCode streams the submitted user prompt as a `text' part too.  Rendering
+that part under the assistant divider makes the popup show a fake answer."
+  (let* ((props (plist-get event :properties))
+         (part (plist-get props :part))
+         (message-id (or (plist-get props :messageID)
+                         (plist-get part :messageID)))
+         (session-id (or (plist-get props :sessionID)
+                         (plist-get part :sessionID))))
+    (if (not message-id)
+        t
+      (equal (oc-hp-display--message-role session-id message-id
+                                          oc-hp-popup-directory)
+             "assistant"))))
+
+(defun oc-hp-display--message-role (session-id message-id directory)
+  "Return the cached role for MESSAGE-ID, fetching SESSION-ID history if needed."
+  (or (gethash message-id oc-hp-display--message-role-by-id)
+      (when session-id
+        (condition-case _err
+            (progn
+              (dolist (message (oc-hp-session-messages session-id directory))
+                (oc-hp-display--cache-message-role
+                 (or (plist-get message :info) message)))
+              (gethash message-id oc-hp-display--message-role-by-id))
+          (error nil)))))
 
 (defun oc-hp-display--handle-status (event)
   "Finalize the turn when `session.status' reports `idle'."

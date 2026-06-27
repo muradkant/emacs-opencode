@@ -29,7 +29,7 @@ Vendor the package dir onto `load-path` and require it:
 ;; in your init.el
 (add-to-list 'load-path "~/.emacs.d/lisp/opencode-hyprland-popup/")
 (require 'opencode-hyprland-popup)
-(global-set-key (kbd "C-c o") #'opencode-hyprland-popup-prompt)
+(opencode-hyprland-popup-global-mode 1) ; C-c o opens, C-c h hides/restores
 ```
 
 The package spawns and owns an `opencode serve --port 0` subprocess (managed mode) and
@@ -47,7 +47,7 @@ The popup frame is titled `OpenCode Prompt`. Match on the title alone — this a
 ```conf
 # ~/.config/hypr/hyprland.conf
 windowrulev2 = float,   title:^(OpenCode Prompt)$
-windowrulev2 = size 90 28, title:^(OpenCode Prompt)$
+windowrulev2 = size 650 380, title:^(OpenCode Prompt)$
 windowrulev2 = center, title:^(OpenCode Prompt)$
 ```
 
@@ -62,13 +62,21 @@ runtime float with `(setq oc-hp-popup-float-on-hyprland nil)`.
 
 ## Usage
 
-- `M-x opencode-hyprland-popup-prompt` (or your key) — open the popup for the current
-  project. Default: continue the most-recent session for that project (or create one).
-- `C-u M-x opencode-hyprland-popup-prompt` — show a session picker (Phase 6) first.
-  First candidate is `*new session*`. Annotations render under vertico+marginalia;
-  under plain IDO they’re hidden (graceful).
+- `C-c o` / `M-x opencode-hyprland-popup-prompt` — open the popup for the current
+  project. If the project has sessions, choose `*new session*` or one of the
+  existing project sessions; if it has none, the session picker is skipped.
+- After the session choice, choose the model. The model picker reads OpenCode's
+  configured providers from the running server, so custom providers and local
+  credentials are reflected instead of hardcoded model names.
+- `C-u M-x opencode-hyprland-popup-prompt` — create a new session immediately.
+  The picker uses `completing-read`; annotations render under vertico+marginalia,
+  and under plain IDO they’re hidden (graceful).
 - Write your prompt in the frame. With evil, `:w` SENDS the prompt as a new turn.
   Without evil, `C-c C-c` also sends.
+- `C-c h` toggles the popup frame itself. From inside the popup it hides the frame
+  without deleting it; from any other Emacs frame it restores that same live frame.
+  It refuses to hide the last visible graphical Emacs frame, because then no Emacs
+  keybinding would remain available to restore it.
 - `q` or `C-c C-k` dismisses the frame; the buffer is BURIED (not killed) so re-opening
   the same session is instant (Phase 10).
 
@@ -129,9 +137,10 @@ buffer refreshes without a manual `M-x revert-buffer`. Toggle the safety net:
 | Variable | Default | Meaning |
 |---|---|---|
 | `oc-hp-popup-frame-title` | `"OpenCode Prompt"` | Frame title Hyprland matches. |
-| `oc-hp-popup-frame-width` / `-height` | `90` / `28` | Popup frame size (chars/lines). |
+| `oc-hp-popup-frame-width` / `-height` | `68` / `19` | Popup frame size (chars/lines). |
 | `oc-hp-popup-float-on-hyprland` | `t` | Float the new frame by its window address (title-resolved) after make-frame. |
-| `oc-hp-popup-default-model` | `nil` | Optional model id for new sessions. |
+| `oc-hp-popup-default-model` | `nil` | Optional default `provider/model` offered in the model picker, e.g. `"opencode/mimo-v2.5-free"`. |
+| `opencode-hyprland-popup-global-mode` | disabled | Optional global bindings: `C-c o` open, `C-c h` hide/restore. |
 | `oc-hp-server-port` | `nil` | `nil` = spawn our own server; a number = attach. |
 | `oc-hp-server-password` | `nil` | Basic-auth password (`OPENCODE_SERVER_PASSWORD`). |
 | `oc-hp-permission-default-yes` | `"once"` | Default yes reply (`once` or `always`). |

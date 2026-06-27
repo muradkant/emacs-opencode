@@ -20,6 +20,7 @@
 ;;   GET    /session/:id/message           — message history
 ;;   POST   /session/:id/prompt_async      — fire-and-forget prompt (204)
 ;;   POST   /session/:id/permissions/:pid — reply to a permission ask (Ph 7)
+;;   GET    /config/providers              — configured providers + models
 ;;
 ;; Sessions are scoped to a project directory.  OpenCode's native scope is
 ;; the git worktree root (brief §3.6 / §4); per-request override is the
@@ -184,13 +185,101 @@ objects have each element converted."
   (oc-hp-session--request "GET" (format "/session/%s" session-id)
                           nil directory))
 
-(defun oc-hp-session-create (&optional title parent-id directory)
-  "Create a new session with optional TITLE and PARENT-ID, in DIRECTORY.
+(defun oc-hp-session-create (&optional title parent-id directory model)
+  "Create a new session with optional TITLE, PARENT-ID, DIRECTORY, and MODEL.
+MODEL may be a string of the form \"provider/model\" or a plist with
+`:providerID' and `:id' keys.
 Returns the created session plist."
   (let ((body '()))
     (when title (setq body (plist-put body :title title)))
     (when parent-id (setq body (plist-put body :parentID parent-id)))
+    (when model (setq body (plist-put body :model
+                                      (oc-hp-session--model-spec model))))
     (oc-hp-session--request "POST" "/session" body directory)))
+
+(defun oc-hp-session--model-spec (model)
+  "Return MODEL as an OpenCode session-create model plist."
+  (cond
+   ((and (consp model)
+         (plist-get model :providerID)
+         (or (plist-get model :id)
+             (plist-get model :modelID)))
+    (list :providerID (plist-get model :providerID)
+          :id (or (plist-get model :id)
+                  (plist-get model :modelID))))
+   ((stringp model)
+    (if (string-match "\\`\\([^/]+\\)/\\(.+\\)\\'" model)
+        (list :providerID (match-string 1 model)
+              :id (match-string 2 model))
+      (list :id model)))
+   (t (error "Unsupported OpenCode model spec: %S" model))))
+
+(defun oc-hp-session--prompt-model-spec (model)
+  "Return MODEL as an OpenCode prompt model plist."
+  (cond
+   ((and (consp model)
+         (plist-get model :providerID)
+         (or (plist-get model :modelID)
+             (plist-get model :id)))
+    (list :providerID (plist-get model :providerID)
+          :modelID (or (plist-get model :modelID)
+                       (plist-get model :id))))
+   ((stringp model)
+    (if (string-match "\\`\\([^/]+\\)/\\(.+\\)\\'" model)
+        (list :providerID (match-string 1 model)
+              :modelID (match-string 2 model))
+      (error "Prompt model must be provider/model: %S" model)))
+   (t (error "Unsupported OpenCode prompt model spec: %S" model))))
+
+(defun oc-hp-session-config-providers (&optional directory)
+  "Return configured OpenCode providers for DIRECTORY."
+  (plist-get (oc-hp-session--request "GET" "/config/providers" nil directory)
+             :providers))
+
+(defun oc-hp-session-models (&optional directory)
+  "Return configured OpenCode models for DIRECTORY as a list of plists.
+This uses OpenCode's own provider/config API, so custom providers and
+machine-local credentials are reflected without hardcoding model names."
+  (let ((providers (oc-hp-session-config-providers directory))
+        models)
+    (dolist (provider providers)
+      (let ((provider-id (plist-get provider :id))
+            (provider-name (plist-get provider :name))
+            (entries (plist-get provider :models)))
+        (while (consp entries)
+          (let ((model (copy-sequence (cadr entries))))
+            (setq model (plist-put model :providerID
+                                   (or (plist-get model :providerID)
+                                       provider-id)))
+            (setq model (plist-put model :modelID
+                                   (or (plist-get model :modelID)
+                                       (plist-get model :id)
+                                       (substring (symbol-name (car entries)) 1))))
+            (setq model (plist-put model :id
+                                   (or (plist-get model :id)
+                                       (plist-get model :modelID))))
+            (setq model (plist-put model :providerName provider-name))
+            (push model models))
+          (setq entries (cddr entries)))))
+    (sort models
+          (lambda (a b)
+            (let ((pa (plist-get a :providerID))
+                  (pb (plist-get b :providerID)))
+              (cond
+               ((and (string-prefix-p "opencode" pa)
+                     (not (string-prefix-p "opencode" pb))) t)
+               ((and (not (string-prefix-p "opencode" pa))
+                     (string-prefix-p "opencode" pb)) nil)
+               ((not (string= pa pb)) (string< pa pb))
+               (t (string< (oc-hp-session-model-key a)
+                           (oc-hp-session-model-key b)))))))))
+
+(defun oc-hp-session-model-key (model)
+  "Return MODEL as provider/model."
+  (format "%s/%s"
+          (plist-get model :providerID)
+          (or (plist-get model :modelID)
+              (plist-get model :id))))
 
 (defun oc-hp-session-messages (session-id &optional directory)
   "Fetch the message history for SESSION-ID.  Returns a list of message plists."
@@ -199,15 +288,21 @@ Returns the created session plist."
                               nil directory)
       '()))
 
-(defun oc-hp-session-prompt-async (session-id prompt &optional directory)
+(defun oc-hp-session-prompt-async (session-id prompt &optional directory model variant)
   "Send PROMPT (a string) to SESSION-ID as a new turn via `prompt_async'.
 Body shape verified against OpenCode v1.17.11 source:
 `{parts:[{type:\"text\", text:<prompt>}]}' (RESEARCH §13.1).
 Returns non-nil on 204.  No body returned."
-  (oc-hp-session--request "POST"
-                          (format "/session/%s/prompt_async" session-id)
-                          (list :parts (list (list :type "text" :text prompt)))
-                          directory)
+  (let ((body (list :parts (list (list :type "text" :text prompt)))))
+    (when model
+      (setq body (plist-put body :model
+                            (oc-hp-session--prompt-model-spec model))))
+    (when variant
+      (setq body (plist-put body :variant variant)))
+    (oc-hp-session--request "POST"
+                            (format "/session/%s/prompt_async" session-id)
+                            body
+                            directory))
   t)
 
 (defun oc-hp-session-abort (session-id &optional directory)

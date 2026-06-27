@@ -18,7 +18,8 @@
 ;;   1. ensure the OpenCode server is running (Phase 2);
 ;;   2. ensure the global SSE stream is connected (Phase 1);
 ;;   3. resolve the per-project directory (Phase 3);
-;;   4. pick (default: most-recent) or create a session for it;
+;;   4. create a session if none exist for the project; otherwise ask the
+;;      user to choose `*new session*' or an existing project session;
 ;;   5. `make-frame' titled \"OpenCode Prompt\" and switch a dedicated
 ;;      buffer to it; the buffer is editable, runs Evil, and overrides
 ;;      `:w' buffer-locally to send the buffer text to the session via
@@ -51,12 +52,12 @@
   :group 'opencode-hyprland-popup
   :prefix "oc-hp-popup-")
 
-(defcustom oc-hp-popup-frame-width 90
+(defcustom oc-hp-popup-frame-width 68
   "Width (chars) of the popup frame."
   :type 'integer
   :group 'opencode-hyprland-popup)
 
-(defcustom oc-hp-popup-frame-height 28
+(defcustom oc-hp-popup-frame-height 19
   "Height (lines) of the popup frame."
   :type 'integer
   :group 'opencode-hyprland-popup)
@@ -73,8 +74,33 @@ address-targeted to that frame's window (resolved by title)."
   :group 'opencode-hyprland-popup)
 
 (defcustom oc-hp-popup-default-model nil
-  "Optional model id to pass when creating a new session.  nil = server default."
+  "Optional model to pass when creating a new session.
+Use \"provider/model\", such as \"opencode/mimo-v2.5-free\".  nil means
+the server default."
   :type '(choice (const :tag "Server default" nil) string)
+  :group 'opencode-hyprland-popup)
+
+(defvar oc-hp-popup--last-frame nil
+  "Most recent popup frame, including when it is invisible.")
+
+(defvar oc-hp-popup--last-buffer nil
+  "Most recent popup buffer shown in `oc-hp-popup--last-frame'.")
+
+(defvar opencode-hyprland-popup-global-mode-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "C-c o") #'opencode-hyprland-popup-prompt)
+    (define-key map (kbd "C-c h") #'opencode-hyprland-popup-toggle-frame)
+    map)
+  "Global keymap for `opencode-hyprland-popup-global-mode'.")
+
+;;;###autoload
+(define-minor-mode opencode-hyprland-popup-global-mode
+  "Global keybindings for the OpenCode popup frontend.
+`C-c o' opens/selects a project session.  `C-c h' hides the popup frame
+when invoked inside it, or restores the same hidden frame from another
+Emacs frame."
+  :global t
+  :keymap opencode-hyprland-popup-global-mode-map
   :group 'opencode-hyprland-popup)
 
 ;;; --- Buffer-local popup state ---
@@ -83,6 +109,8 @@ address-targeted to that frame's window (resolved by title)."
   "The OpenCode session id backing this popup buffer.")
 (defvar-local oc-hp-popup-directory nil
   "The project directory (x-opencode-directory) backing this popup buffer.")
+(defvar-local oc-hp-popup-model nil
+  "The selected OpenCode model plist backing future prompts in this buffer.")
 (defvar-local oc-hp-popup-frame nil
   "The dedicated frame for this popup buffer (if any).")
 (defvar-local oc-hp-popup-phase 0
@@ -104,13 +132,16 @@ above it is what the user is currently writing.  -- used from Phase 9 onward.")
     (let ((buf (get-buffer name)))
       (and (buffer-live-p buf) buf))))
 
-(defconst oc-hp-popup--mode-map
-  (let ((map (make-sparse-keymap)))
-    (define-key map (kbd "q")          #'oc-hp-popup-quit)
-    (define-key map (kbd "C-c C-k")    #'oc-hp-popup-quit)
-    (define-key map (kbd "C-c C-c")    #'oc-hp-popup-send)
-    map)
+(defvar opencode-hyprland-popup-mode-map (make-sparse-keymap)
   "Keymap for `opencode-hyprland-popup-mode'.")
+(define-key opencode-hyprland-popup-mode-map (kbd "q")       #'oc-hp-popup-quit)
+(define-key opencode-hyprland-popup-mode-map (kbd "C-c C-k") #'oc-hp-popup-quit)
+(define-key opencode-hyprland-popup-mode-map (kbd "C-c C-c") #'oc-hp-popup-send)
+(define-key opencode-hyprland-popup-mode-map (kbd "C-c h")
+            #'opencode-hyprland-popup-toggle-frame)
+
+(defconst oc-hp-popup--mode-map opencode-hyprland-popup-mode-map
+  "Compatibility alias for the popup mode keymap.")
 
 (define-derived-mode opencode-hyprland-popup-mode text-mode
   "OC-Popup"
@@ -149,17 +180,69 @@ so without the copy the override would leak into every other buffer."
   (oc-hp-permission-attach)              ; Phase 7: register permission.asked
   (oc-hp-revert-attach))                 ; Phase 8: reverts touched buffers
 
-;;; --- Session selection (default path) ---
+;;; --- Session selection ---
 
-(defun oc-hp-popup--pick-session (directory)
-  "Return a session id for DIRECTORY: the most recent, or a freshly created one.
-This is the Phase-4 default; the prefix-arg session picker is Phase 6."
+(defun oc-hp-popup--new-session (directory model)
+  "Create a fresh OpenCode session in DIRECTORY with MODEL and return its id."
+  (let ((created (oc-hp-session-create nil nil directory model)))
+    (and created (plist-get created :id))))
+
+(defun oc-hp-popup--choose-session (directory &optional force-new)
+  "Return a session selection for DIRECTORY.
+The result is either an existing session plist or `(:new t)'.  With
+FORCE-NEW, request a fresh session immediately.  Otherwise, request a
+fresh session when none exist for DIRECTORY; when sessions do exist, ask
+the user to choose `*new session*' or one of the existing project sessions."
   (oc-hp-popup--ensure-backend)
-  (let* ((sessions (oc-hp-session-list directory))
-         (recent (oc-hp-session-most-recent sessions)))
-    (or (and recent (plist-get recent :id))
-        (let ((created (oc-hp-session-create nil nil directory)))
-          (and created (plist-get created :id))))))
+  (if force-new
+      (list :new t)
+    (let ((sessions (oc-hp-session-list directory)))
+      (if (null sessions)
+          (list :new t)
+        (oc-hp-picker-select sessions directory)))))
+
+(defun oc-hp-popup--choose-model (directory &optional default-model)
+  "Return a configured OpenCode model plist for DIRECTORY."
+  (let ((models (oc-hp-session-models directory)))
+    (unless models
+      (user-error "OpenCode: no configured models found"))
+    (or (oc-hp-picker-select-model models
+                                   (or default-model
+                                       oc-hp-popup-default-model))
+        (user-error "OpenCode: no model selected"))))
+
+(defun oc-hp-popup--session-id-for-selection (directory selection model)
+  "Return a session id for SELECTION, creating a new session with MODEL."
+  (cond
+   ((plist-get selection :new)
+    (or (oc-hp-popup--new-session directory model)
+        (error "OpenCode: could not create session")))
+   ((plist-get selection :id)
+    (plist-get selection :id))
+   (t nil)))
+
+(defun oc-hp-popup--selection-default-model (selection directory)
+  "Return the best default model for SELECTION in DIRECTORY, or nil."
+  (or oc-hp-popup-default-model
+      (and (plist-get selection :id)
+           (oc-hp-popup--session-last-model (plist-get selection :id)
+                                            directory))))
+
+(defun oc-hp-popup--session-last-model (session-id directory)
+  "Return the most recent model used by SESSION-ID, or nil."
+  (condition-case _err
+      (cl-block nil
+        (dolist (message (reverse (oc-hp-session-messages session-id directory)))
+          (let* ((info (oc-hp-popup--message-info message))
+                 (model (or (plist-get info :model)
+                            (and (plist-get info :providerID)
+                                 (list :providerID (plist-get info :providerID)
+                                       :modelID (plist-get info :modelID))))))
+            (when (and (plist-get model :providerID)
+                       (or (plist-get model :modelID)
+                           (plist-get model :id)))
+              (cl-return model)))))
+    (error nil)))
 
 ;;; --- Send (the :w handler) ---
 
@@ -194,7 +277,8 @@ Phase 1 (a turn still streaming) is refused to protect the display FSM."
     (condition-case err
         (progn
           (oc-hp-display--on-send)         ; open ephemeral region + prep SSE handlers (Phase 5)
-          (oc-hp-session-prompt-async session-id prompt directory)
+          (oc-hp-session-prompt-async session-id prompt directory
+                                      oc-hp-popup-model)
           (message "OpenCode: prompt sent to session %s%s"
                    session-id (if follow-up-p " (follow-up)" "")))
       (error
@@ -215,6 +299,88 @@ Trimmed on both ends so a leading/trailing blank the user left is ignored."
     (buffer-substring-no-properties (point-min) (point-max))))
 
 ;;; --- Dismiss / quit ---
+
+(defun oc-hp-popup--frame-buffer (frame)
+  "Return FRAME's root-window buffer, or nil."
+  (when (frame-live-p frame)
+    (let ((window (frame-root-window frame)))
+      (and (window-live-p window)
+           (window-buffer window)))))
+
+(defun oc-hp-popup--popup-frame-p (frame)
+  "Return non-nil when FRAME is an OpenCode popup frame."
+  (and (frame-live-p frame)
+       (or (eq frame oc-hp-popup--last-frame)
+           (equal (frame-parameter frame 'name) oc-hp-popup-frame-title)
+           (let ((buf (oc-hp-popup--frame-buffer frame)))
+             (and (buffer-live-p buf)
+                  (with-current-buffer buf
+                    (derived-mode-p 'opencode-hyprland-popup-mode)))))))
+
+(defun oc-hp-popup--remember-frame (frame buffer)
+  "Remember FRAME and BUFFER as the active popup pair."
+  (when (frame-live-p frame)
+    (setq oc-hp-popup--last-frame frame)
+    (when (buffer-live-p buffer)
+      (setq oc-hp-popup--last-buffer buffer)
+      (with-current-buffer buffer
+        (setq-local oc-hp-popup-frame frame)))))
+
+(defun oc-hp-popup--known-frame ()
+  "Return the remembered popup frame, or discover a live one."
+  (or (and (frame-live-p oc-hp-popup--last-frame)
+           oc-hp-popup--last-frame)
+      (setq oc-hp-popup--last-frame
+            (cl-find-if #'oc-hp-popup--popup-frame-p (frame-list)))))
+
+(defun oc-hp-popup--visible-graphic-frame-count ()
+  "Return the number of visible graphical Emacs frames."
+  (cl-count-if (lambda (frame)
+                 (and (frame-live-p frame)
+                      (display-graphic-p frame)
+                      (frame-visible-p frame)))
+               (frame-list)))
+
+(defun oc-hp-popup--hide-frame (frame)
+  "Make FRAME invisible without deleting it."
+  (let ((buf (oc-hp-popup--frame-buffer frame)))
+    (oc-hp-popup--remember-frame frame buf)
+    (if (<= (oc-hp-popup--visible-graphic-frame-count) 1)
+        (user-error "OpenCode popup: cannot hide the only visible graphical Emacs frame")
+      (make-frame-invisible frame t)
+      (when (buffer-live-p buf)
+        (bury-buffer buf))
+      (message "OpenCode popup: hidden"))))
+
+(defun oc-hp-popup--show-frame (frame)
+  "Make FRAME visible and focused without recreating it."
+  (let ((buf (or (oc-hp-popup--frame-buffer frame)
+                 oc-hp-popup--last-buffer)))
+    (make-frame-visible frame)
+    (oc-hp-popup--resize-frame frame)
+    (when (buffer-live-p buf)
+      (set-window-buffer (frame-root-window frame) buf)
+      (oc-hp-popup--remember-frame frame buf))
+    (oc-hp-popup--hyprland-float frame)
+    (raise-frame frame)
+    (select-frame-set-input-focus frame)
+    (message "OpenCode popup: shown")))
+
+;;;###autoload
+(defun opencode-hyprland-popup-toggle-frame ()
+  "Hide the popup frame, or restore the last hidden popup frame.
+When invoked from the popup frame, the frame is made invisible rather
+than deleted.  When invoked from any other Emacs frame, the same live
+frame is made visible again, preserving its buffer, point, window state,
+and OpenCode session."
+  (interactive)
+  (let ((selected (selected-frame)))
+    (if (oc-hp-popup--popup-frame-p selected)
+        (oc-hp-popup--hide-frame selected)
+      (let ((frame (oc-hp-popup--known-frame)))
+        (unless (frame-live-p frame)
+          (user-error "OpenCode popup: no hidden popup frame to restore"))
+        (oc-hp-popup--show-frame frame)))))
 
 (defun oc-hp-popup-quit ()
   "Dismiss the popup frame and bury its buffer (don't kill — Phase 10)."
@@ -250,7 +416,16 @@ Trimmed on both ends so a leading/trailing blank the user left is ignored."
     (with-current-buffer (window-buffer (frame-root-window frame))
       (setq oc-hp-popup-frame frame))
     (oc-hp-popup--hyprland-float frame)
+    (oc-hp-popup--resize-frame frame)
+    (run-with-timer 0.15 nil #'oc-hp-popup--resize-frame frame)
     frame))
+
+(defun oc-hp-popup--resize-frame (frame)
+  "Apply the configured popup size to FRAME when it is still live."
+  (when (frame-live-p frame)
+    (set-frame-size frame
+                    oc-hp-popup-frame-width
+                    oc-hp-popup-frame-height)))
 
 (defun oc-hp-popup--hyprland-float (frame)
   "Imperatively float FRAME on Hyprland if running under XWayland.
@@ -335,26 +510,26 @@ on parse failure so the caller's `listp' guard rejects it cleanly."
 ;;;###autoload
 (defun opencode-hyprland-popup-prompt (&optional arg)
   "Open a floating OpenCode popup for the current project.
-With prefix ARG, show a session picker for this project; otherwise
-continue the most-recent session for the project (or create one)."
+If the current project has no sessions, create one immediately.  Otherwise
+ask whether to create a new session or continue an existing project session.
+With prefix ARG, create a new session immediately."
   (interactive "P")
   (oc-hp-popup--ensure-backend)
   (let* ((directory (oc-hp-session-find-directory))
-         (session-id
-          (if arg
-              (oc-hp-popup--pick-session-with-picker directory)
-            (or (oc-hp-popup--pick-session directory)
-                (error "OpenCode: could not pick or create a session")))))
+         (selection (or (oc-hp-popup--choose-session directory arg)
+                        (error "OpenCode: could not pick or create a session")))
+         (model (oc-hp-popup--choose-model
+                 directory
+                 (oc-hp-popup--selection-default-model selection directory)))
+         (session-id (or (oc-hp-popup--session-id-for-selection
+                          directory selection model)
+                         (error "OpenCode: could not pick or create a session"))))
     (unless session-id
       (user-error "OpenCode: no session selected"))
     (let ((buf (oc-hp-popup--ensure-buffer session-id directory)))
+      (with-current-buffer buf
+        (setq-local oc-hp-popup-model model))
       (oc-hp-popup--pop buf))))
-
-(defun oc-hp-popup--pick-session-with-picker (directory)
-  "Show the session picker for DIRECTORY; return the chosen session id."
-  (let* ((sessions (oc-hp-session-list directory))
-         (chosen (oc-hp-picker-select sessions directory)))
-    (and chosen (plist-get chosen :id))))
 
 (defun oc-hp-popup--ensure-buffer (session-id directory)
   "Return a live popup buffer for SESSION-ID, creating or resurrecting it."
@@ -365,16 +540,180 @@ continue the most-recent session for the project (or create one)."
             (opencode-hyprland-popup-mode))
           (setq-local oc-hp-popup-session-id session-id
                       oc-hp-popup-directory directory
+                      oc-hp-popup-model nil
                       oc-hp-popup-phase 0)
           (erase-buffer)
-          (insert "\n")
+          (unless (and (ignore-errors (oc-hp-server-connected-p))
+                       (oc-hp-popup--hydrate-buffer session-id directory))
+            (insert "\n"))
           (goto-char (point-min)))
         buf)))
 
+(defun oc-hp-popup--hydrate-buffer (session-id directory)
+  "Populate the current popup buffer from SESSION-ID history.
+Returns non-nil when history was rendered.  Only the latest useful turn is
+shown: the last user prompt plus the last assistant response.  If the
+session has a user prompt but no assistant response yet, render that prompt
+as an editable phase-0 prompt."
+  (condition-case err
+      (let* ((messages (oc-hp-session-messages session-id directory))
+             (turn (oc-hp-popup--last-turn messages))
+             (prompt (plist-get turn :prompt))
+             (answer (plist-get turn :answer)))
+        (cond
+         ((and prompt answer)
+          (let ((inhibit-read-only t))
+            (insert prompt)
+            (unless (bolp) (insert "\n"))
+            (insert "\n")
+            (insert (propertize oc-hp-display-divider
+                                'face 'oc-hp-display-divider-face
+                                'read-only t))
+            (insert "\n")
+            (insert (propertize answer 'face 'oc-hp-display-answer-face))
+            (insert "\n\n")
+            (setq-local oc-hp-popup-phase 2
+                        oc-hp-display--finalized t
+                        oc-hp-popup-answer-end (copy-marker (point) nil)))
+          t)
+         (prompt
+          (let ((inhibit-read-only t))
+            (insert prompt)
+            (setq-local oc-hp-popup-phase 0))
+          t)
+         (t nil)))
+    (error
+     (message "OpenCode popup: could not hydrate session %s: %s"
+              session-id (error-message-string err))
+     nil)))
+
+(defun oc-hp-popup--last-turn (messages)
+  "Return a plist with the latest prompt/answer extracted from MESSAGES."
+  (let* ((assistant (oc-hp-popup--last-message-with-role messages "assistant"))
+         (answer (and assistant (oc-hp-popup--message-text assistant)))
+         (parent-id (and assistant
+                         (plist-get (oc-hp-popup--message-info assistant)
+                                    :parentID)))
+         (user (or (and parent-id
+                        (oc-hp-popup--message-by-id messages parent-id))
+                   (and assistant
+                        (oc-hp-popup--previous-message-with-role
+                         messages assistant "user"))
+                   (oc-hp-popup--last-message-with-role messages "user")))
+         (prompt (and user
+                      (oc-hp-popup--normalize-user-prompt
+                       (oc-hp-popup--message-text user)
+                       messages user))))
+    (cond
+     ((and prompt answer)
+      (list :prompt prompt :answer answer))
+     (prompt
+      (list :prompt prompt))
+     (answer
+      (list :answer answer)))))
+
+(defun oc-hp-popup--message-info (message)
+  "Return MESSAGE's info plist, accepting raw info plists too."
+  (or (plist-get message :info) message))
+
+(defun oc-hp-popup--message-role (message)
+  "Return MESSAGE's role string."
+  (plist-get (oc-hp-popup--message-info message) :role))
+
+(defun oc-hp-popup--message-id (message)
+  "Return MESSAGE's id string."
+  (plist-get (oc-hp-popup--message-info message) :id))
+
+(defun oc-hp-popup--message-text (message)
+  "Return MESSAGE text by joining its text parts."
+  (let ((texts nil))
+    (dolist (part (plist-get message :parts))
+      (when (and (equal (plist-get part :type) "text")
+                 (plist-get part :text))
+        (push (plist-get part :text) texts)))
+    (let ((text (string-trim (mapconcat #'identity (nreverse texts) "\n\n"))))
+      (unless (string-empty-p text)
+        text))))
+
+(defun oc-hp-popup--normalize-user-prompt (prompt messages user)
+  "Return PROMPT as it should appear in the popup.
+Old follow-up sends could accidentally store the whole visible transcript
+as the next user message.  When that legacy shape is detectable, trim it
+back to only the trailing prompt the user actually typed."
+  (let* ((previous-assistant
+          (and prompt
+               (oc-hp-popup--previous-message-with-role messages user "assistant")))
+         (previous-answer
+          (and previous-assistant
+               (oc-hp-popup--message-text previous-assistant)))
+         (after-answer
+          (and previous-answer
+               (oc-hp-popup--substring-after-last prompt previous-answer)))
+         (divider-p
+          (and prompt
+               (string-match-p (regexp-quote oc-hp-display-divider) prompt)))
+         (legacy-after-answer-p
+          (and after-answer
+               (string-match-p "\\`[ \t\n\r]+\\S-" after-answer)))
+         (normalized
+          (cond
+           (legacy-after-answer-p after-answer)
+           (divider-p (oc-hp-popup--prompt-after-last-divider prompt)))))
+    (if (and normalized (not (string-empty-p (string-trim normalized))))
+        (string-trim normalized)
+      prompt)))
+
+(defun oc-hp-popup--substring-after-last (string needle)
+  "Return the substring after NEEDLE's last occurrence in STRING."
+  (when (and string needle (not (string-empty-p needle)))
+    (let ((start 0)
+          end)
+      (while (string-match (regexp-quote needle) string start)
+        (setq end (match-end 0)
+              start (match-end 0)))
+      (and end (substring string end)))))
+
+(defun oc-hp-popup--prompt-after-last-divider (prompt)
+  "Best-effort fallback for a PROMPT containing a historical transcript."
+  (let ((after-divider (oc-hp-popup--substring-after-last
+                        prompt oc-hp-display-divider)))
+    (when after-divider
+      (car (last (split-string after-divider "\n[ \t]*\n+" t))))))
+
+(defun oc-hp-popup--last-message-with-role (messages role)
+  "Return the last message in MESSAGES whose role is ROLE."
+  (cl-find-if (lambda (message)
+                (equal (oc-hp-popup--message-role message) role))
+              (reverse messages)))
+
+(defun oc-hp-popup--message-by-id (messages id)
+  "Return the message in MESSAGES whose id is ID."
+  (cl-find-if (lambda (message)
+                (equal (oc-hp-popup--message-id message) id))
+              messages))
+
+(defun oc-hp-popup--previous-message-with-role (messages marker role)
+  "Return the last ROLE message before MARKER in MESSAGES."
+  (let ((seen nil)
+        (found nil))
+    (dolist (message messages)
+      (cond
+       ((eq message marker)
+        (setq seen t))
+       ((and (not seen)
+             (equal (oc-hp-popup--message-role message) role))
+        (setq found message))))
+    found))
+
 (defun oc-hp-popup--pop (buf)
-  "Show BUF in a fresh popup frame, focused."
-  (let ((frame (oc-hp-popup--make-frame)))
+  "Show BUF in a popup frame, focused.
+Reuse BUF's existing live frame when present, including an invisible one."
+  (let ((frame (or (with-current-buffer buf
+                     (and (frame-live-p oc-hp-popup-frame)
+                          oc-hp-popup-frame))
+                   (oc-hp-popup--make-frame))))
     (let ((win (frame-root-window frame)))
+      (make-frame-visible frame)
       (set-window-buffer win buf)
       (select-frame frame)
       (select-window win)
@@ -384,9 +723,16 @@ continue the most-recent session for the project (or create one)."
         (setq mode-line-format
               '("OC-Prompt  session: " (:eval (or oc-hp-popup-session-id "?"))
                 "  dir: " (:eval (or oc-hp-popup-directory "?"))
+                "  model: " (:eval (if oc-hp-popup-model
+                                       (oc-hp-session-model-key
+                                        oc-hp-popup-model)
+                                     "?"))
                 "  phase: " (:eval (number-to-string oc-hp-popup-phase))))))
-    (with-current-buffer buf
-      (setq oc-hp-popup-frame frame))
+    (oc-hp-popup--remember-frame frame buf)
+    (oc-hp-popup--resize-frame frame)
+    (oc-hp-popup--hyprland-float frame)
+    (raise-frame frame)
+    (select-frame-set-input-focus frame)
     frame))
 
 (provide 'opencode-hyprland-popup)

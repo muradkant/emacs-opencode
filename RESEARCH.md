@@ -77,7 +77,7 @@ class matcher at all:
 ```conf
 # ~/.config/hypr/hyprland.conf
 windowrulev2 = float,   title:^(OpenCode Prompt)$
-windowrulev2 = size 90 28, title:^(OpenCode Prompt)$
+windowrulev2 = size 650 380, title:^(OpenCode Prompt)$
 windowrulev2 = center, title:^(OpenCode Prompt)$
 ```
 
@@ -517,20 +517,24 @@ anchors `oc-hp-popup-answer-end` at the end of the finalized answer) and
 `opencode-hyprland-popup.el` (`oc-hp-popup--current-prompt-text` branches on
 `oc-hp-popup-phase`; `oc-hp-popup-send` wipes to `[prompt2]` before reopening
 the divider and refuses sends while phase 1). Verified live in `--batch` by
-`oc-hp-phase9-test.el`: 9/9 checks pass — turn1 finalizes with the answer-end
+`oc-hp-phase9-test.el`: 12/12 checks pass — turn1 finalizes with the answer-end
 marker set, a follow-up `:w` extracts ONLY `prompt2` (text after the marker),
 the buffer wipes to `[prompt2]`, phase resets to 0, a first turn returns the
-whole buffer, and a phase-1 send is refused.
+whole buffer, a phase-1 send is refused, and user-message text parts are not
+rendered as assistant output.
 
 ### 14.2 Phase 10 — buffer pool (bury, don't kill)
 Already correct from Phase 4 (`oc-hp-popup-quit` buries; `--ensure-buffer`
 reuses via `--live-buffer` then `get-buffer-create`). Confirmed no code change
-was needed. `oc-hp-phase10-test.el`: 7/7 checks pass — reuse-same-id → `eq`
+was needed. `oc-hp-phase10-test.el`: 16/16 checks pass — reuse-same-id → `eq`
 buffer; distinct ids → distinct coexisting buffers; `quit` keeps the buffer
 live (buried, not killed); re-open after quit reuses the SAME buried buffer
 and its preserved content. Multiple session popup buffers coexist in the pool
-(one `*opencode-prompt<ses_id>*` per session), so a prefix-arg picker swap
-leaves the original session's buffer buried-but-alive ready to re-open.
+(one `*opencode-prompt<ses_id>*` per session), so switching through the project
+session picker leaves the original session's buffer buried-but-alive ready to
+re-open. The same test also pins the launcher policy: no project sessions
+creates immediately, existing project sessions show the picker, and prefix
+forces a new session.
 
 ### 14.3 Batch transport smoke test (Phases 1-3 regression)
 `oc-hp-smoke.el` spawns a real `opencode serve` (Phase 2), connects the

@@ -112,6 +112,56 @@
                (error nil))))
         (oc-hp-phase9--ok "T5: phase 1 send refused" refused t)))))
 
+(defun oc-hp-phase9--test-user-parts-not-rendered ()
+  "The display must not render the submitted user prompt as assistant text."
+  (let ((buf (get-buffer-create "*opencode-prompt<ses_role>*")))
+    (with-current-buffer buf
+      (unless (derived-mode-p 'opencode-hyprland-popup-mode)
+        (opencode-hyprland-popup-mode))
+      (setq-local oc-hp-popup-session-id "ses_role"
+                  oc-hp-popup-directory "/tmp"
+                  oc-hp-popup-phase 0)
+      (erase-buffer)
+      (insert "What model is this?")
+      (clrhash oc-hp-display--message-role-by-id)
+      (cl-letf (((symbol-function 'oc-hp-session-messages)
+                 (lambda (&rest _)
+                   (list
+                    (list :info (list :id "msg_user" :role "user"))
+                    (list :info (list :id "msg_assistant"
+                                      :role "assistant"))))))
+        (oc-hp-display--on-send)
+        (oc-hp-display--on-part-updated
+         (list :type "message.part.updated"
+               :properties
+               (list :sessionID "ses_role"
+                     :part (list :id "prt_user"
+                                 :messageID "msg_user"
+                                 :sessionID "ses_role"
+                                 :type "text"
+                                 :text "What model is this?"))))
+        (oc-hp-phase9--ok "T6: user text part ignored"
+                          oc-hp-display--text-by-part nil)
+        (oc-hp-phase9--ok "T6: no prompt echo under assistant divider"
+                          (string-match-p
+                           "What model is this?"
+                           (buffer-substring-no-properties
+                            oc-hp-display--eph-start (point-max)))
+                          nil)
+        (oc-hp-display--on-part-updated
+         (list :type "message.part.updated"
+               :properties
+               (list :sessionID "ses_role"
+                     :part (list :id "prt_assistant"
+                                 :messageID "msg_assistant"
+                                 :sessionID "ses_role"
+                                 :type "text"
+                                 :text "Real answer"))))
+        (oc-hp-phase9--ok "T6: assistant text part rendered"
+                          (and (string-match-p "Real answer" (buffer-string))
+                               t)
+                          t)))))
+
 (defun oc-hp-phase9-run ()
   "Run the Phase 9 unit tests and print the summary."
   (setq oc-hp-phase9--results nil)
@@ -121,6 +171,7 @@
   (oc-hp-phase9--test-follow-up-extraction)
   (oc-hp-phase9--test-first-turn-whole-buffer)
   (oc-hp-phase9--test-phase1-guard)
+  (oc-hp-phase9--test-user-parts-not-rendered)
   (let ((lines (nreverse oc-hp-phase9--results)))
     (dolist (l lines) (message "PHASE9 %s" l))
     (let ((fails (seq-filter (lambda (s) (string-prefix-p "[FAIL]" s)) lines)))

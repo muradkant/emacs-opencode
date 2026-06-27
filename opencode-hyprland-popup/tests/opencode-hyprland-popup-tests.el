@@ -6,12 +6,13 @@
 ;;   emacs --batch -L <pkg-dir> -L <evil-dir> \
 ;;         -l tests/opencode-hyprland-popup-tests.el -f oc-hp-run-batch-tests
 ;; Bundled batch tests (same dir): oc-hp-smoke.el (Phases 1-3 transport),
-;; oc-hp-phase9-test.el (Phase 9 FSM), oc-hp-phase10-test.el (Phase 10 pool).
+;; oc-hp-phase9-test.el (Phase 9 FSM), oc-hp-phase10-test.el (Phase 10 pool),
+;; oc-hp-session-safety-test.el (no buffer mutation on directory resolution).
 ;;
 ;; INTERACTIVE (needs your real Emacs + display + a little LLM quota).
 ;; Each command opens the popup and prints acceptance steps to *Messages*:
 ;;   M-x oc-hp-test-phase5-streaming    live three-phase display (Phase 5)
-;;   M-x oc-hp-test-phase6-picker       C-u session picker (Phase 6)
+;;   M-x oc-hp-test-phase6-picker       project session picker (Phase 6)
 ;;   M-x oc-hp-test-phase7-permission   y-or-n-p in popup minibuffer (Phase 7)
 ;;   M-x oc-hp-test-phase8-revert       revert a buffer OpenCode wrote (Phase 8)
 ;;   M-x oc-hp-test-phase9-two-turn     two-turn [q2 a2] not stacked (Phase 9)
@@ -36,7 +37,8 @@
   "Run the bundled batch tests (smoke + phase9 + phase10) and summarise."
   (interactive)
   (let ((dir oc-hp-test-dir))
-    (dolist (base '("oc-hp-smoke" "oc-hp-phase9-test" "oc-hp-phase10-test"))
+    (dolist (base '("oc-hp-smoke" "oc-hp-phase9-test" "oc-hp-phase10-test"
+                    "oc-hp-session-safety-test"))
       (let ((f (expand-file-name (concat base ".el") dir)))
         (when (file-exists-p f) (load f nil t))))
     (message "----- batch: smoke (Phases 1-3) -----")
@@ -46,6 +48,8 @@
     (oc-hp-phase9-run)
     (message "----- batch: phase10 (buffer pool) -----")
     (oc-hp-p10-run)
+    (message "----- batch: session-safety (no buffer mutation) -----")
+    (oc-hp-session-safety-run)
     (message "========================================================")
     (message "BATCH SUMMARY: see the RESULT: lines above for each suite.")
     (message "========================================================")))
@@ -66,16 +70,15 @@
   (opencode-hyprland-popup-prompt))
 
 (defun oc-hp-test-phase6-picker ()
-  "Phase 6: invoke the session picker as if with C-u."
+  "Phase 6: invoke the project session picker."
   (interactive)
   (oc-hp-test--banner
-   '("PHASE 6 — session picker (prefix arg)"
+   '("PHASE 6 — project session picker"
      "A completing-read picker should appear with sessions for THIS project."
      "First candidate is '*new session*'.  Under vertico+marginalia you see"
      "annotations (id / msg count / time-ago); under plain IDO they are hidden."
      "Pick one (or new), then proceed as Phase 5."))
-  (let ((current-prefix-arg '(4)))
-    (opencode-hyprland-popup-prompt '(4))))
+  (opencode-hyprland-popup-prompt))
 
 (defun oc-hp-test-phase7-permission ()
   "Phase 7: prompt a tool that hits an ask rule; expect a y-or-n-p."
