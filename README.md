@@ -32,6 +32,10 @@ Clone the repo and add it to `load-path`:
 (opencode-hyprland-popup-global-mode 1) ; C-c o opens, C-c h hides/restores
 ```
 
+If `C-c o` is undefined after updating from an older checkout, make sure
+`load-path` points at the flattened repo root, not the former
+`opencode-hyprland-popup/` subdirectory.
+
 The package spawns and owns an `opencode serve --port 0` subprocess (managed mode) and
 kills it on Emacs exit. To attach to an externally-run server instead:
 
