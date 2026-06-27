@@ -23,11 +23,11 @@ or tool behaviour. It only chose how you write prompts and how OpenCode's output
 
 ## Install
 
-Vendor the package dir onto `load-path` and require it:
+Clone the repo and add it to `load-path`:
 
 ```elisp
 ;; in your init.el
-(add-to-list 'load-path "~/.emacs.d/lisp/opencode-hyprland-popup/")
+(add-to-list 'load-path "~/path/to/emacs-opencode/")
 (require 'opencode-hyprland-popup)
 (opencode-hyprland-popup-global-mode 1) ; C-c o opens, C-c h hides/restores
 ```
