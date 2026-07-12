@@ -38,7 +38,8 @@
 
 (defun oc-hp-session-safety--summarise ()
   "Print the collected results and a one-line RESULT summary."
-  (let ((lines (nreverse oc-hp-session-safety--res)))
+  (setq oc-hp-session-safety--res (nreverse oc-hp-session-safety--res))
+  (let ((lines oc-hp-session-safety--res))
     (dolist (l lines) (message "SAFETY %s" l))
     (let ((fails (seq-filter
                   (lambda (s) (string-prefix-p "[FAIL]" s)) lines)))

@@ -2,9 +2,7 @@
 
 ;; Test harness for opencode-hyprland-popup.el.  See ../../README.md for the full guide.
 ;;
-;; BATCH (deterministic, no quota) — run from a terminal:
-;;   emacs --batch -L <pkg-dir> -L <evil-dir> \
-;;         -l tests/opencode-hyprland-popup-tests.el -f oc-hp-run-batch-tests
+;; BATCH (deterministic, no quota): ./tests/run-batch.sh
 ;; Bundled batch tests (same dir): oc-hp-smoke.el (Phases 1-3 transport),
 ;; oc-hp-phase9-test.el (Phase 9 FSM), oc-hp-phase10-test.el (Phase 10 pool),
 ;; oc-hp-session-safety-test.el (no buffer mutation on directory resolution).
@@ -34,25 +32,40 @@
   (message "========================================================"))
 
 (defun oc-hp-run-batch-tests ()
-  "Run the bundled batch tests (smoke + phase9 + phase10) and summarise."
+  "Run every bundled batch suite and exit nonzero if one fails."
   (interactive)
   (let ((dir oc-hp-test-dir))
     (dolist (base '("oc-hp-smoke" "oc-hp-phase9-test" "oc-hp-phase10-test"
                     "oc-hp-session-safety-test"))
       (let ((f (expand-file-name (concat base ".el") dir)))
         (when (file-exists-p f) (load f nil t))))
-    (message "----- batch: smoke (Phases 1-3) -----")
-    (condition-case e (progn (oc-hp-smoke--run) (oc-hp-smoke--teardown))
-      (error (message "smoke error: %s" (error-message-string e))))
+    (message "----- batch: transport smoke -----")
+    (let ((smoke-ok
+           (condition-case e
+               (unwind-protect (oc-hp-smoke--run)
+                 (oc-hp-smoke--teardown))
+             (error
+              (message "smoke error: %s" (error-message-string e))
+              nil))))
     (message "----- batch: phase9 (follow-up FSM) -----")
     (oc-hp-phase9-run)
     (message "----- batch: phase10 (buffer pool) -----")
     (oc-hp-p10-run)
     (message "----- batch: session-safety (no buffer mutation) -----")
     (oc-hp-session-safety-run)
-    (message "========================================================")
-    (message "BATCH SUMMARY: see the RESULT: lines above for each suite.")
-    (message "========================================================")))
+    (let ((failed
+           (or (not smoke-ok)
+               (seq-some (lambda (line) (string-prefix-p "[FAIL]" line))
+                         oc-hp-phase9--results)
+               (seq-some (lambda (line) (string-prefix-p "[FAIL]" line))
+                         oc-hp-p10--res)
+               (seq-some (lambda (line) (string-prefix-p "[FAIL]" line))
+                         oc-hp-session-safety--res))))
+      (message "========================================================")
+      (message "BATCH RESULT: %s" (if failed "FAILED" "ALL PASS"))
+      (message "========================================================")
+      (when (and noninteractive failed)
+        (kill-emacs 1))))))
 
 (defun oc-hp-test-phase5-streaming ()
   "Phase 5: open the popup and walk the user through a live streaming turn."
