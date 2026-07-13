@@ -21,13 +21,13 @@ though the package also refreshes buffers touched by OpenCode after each turn.
 ## Install
 
 ```sh
-git clone https://github.com/muradkant/emacs-opencode.git
+git clone https://github.com/muradkant/emacs-oc.git
 ```
 
 Add the repository root to `load-path`:
 
 ```elisp
-(add-to-list 'load-path "~/path/to/emacs-opencode")
+(add-to-list 'load-path "~/path/to/emacs-oc")
 (require 'opencode-hyprland-popup)
 (opencode-hyprland-popup-global-mode 1)
 ```
