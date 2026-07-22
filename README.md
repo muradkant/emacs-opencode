@@ -9,9 +9,9 @@ configuration nor changes its permissions or tool behaviour.
 
 ## Requirements
 
-- Emacs 27.1+ with graphical frames (pgtk or GTK/X11 under XWayland)
+- Emacs 28.1+ with graphical frames (pgtk or GTK/X11 under XWayland)
 - `curl` and OpenCode on `exec-path`
-- an authenticated OpenCode installation (tested with 1.17.11)
+- an authenticated OpenCode installation (tested with 1.17.18)
 - Evil for `:w`; without Evil, `C-c C-c` sends
 
 Hyprland integration is guarded by an X window system plus `hyprctl`; elsewhere
@@ -62,14 +62,17 @@ live reasoning, tools, and text  →  final answer
 ```
 
 When OpenCode becomes idle, the live region is replaced by the joined answer.
+Failures remain visible as errors instead of being reported as blank answers.
 Type a follow-up below it and send again: only the new text is submitted, the
 buffer becomes the new prompt and answer, and OpenCode retains the full session
 history server-side.
 
 `C-c h` hides the popup without destroying its live buffer and restores the
 same frame from elsewhere. It refuses to hide the last visible graphical Emacs
-frame, which would strand the restore binding. `q` or `C-c C-k` dismisses and
-buries the frame; reopening that session is therefore immediate.
+frame, which would strand the restore binding. `q` in Evil normal state or
+`C-c C-k` in any state dismisses and buries the frame; reopening that session
+is therefore immediate. Different sessions retain independent buffers and
+popup frames, so several can remain visible and stream concurrently.
 
 ### Project scope
 
@@ -83,9 +86,9 @@ the scope.
 
 An OpenCode `ask` rule appears in the popup's own minibuffer:
 
-- `y` approves once;
-- `C-u y` approves always and persists the rule;
-- `n` rejects and aborts the turn.
+- `o` approves once;
+- `a` approves always and persists the rule;
+- `r` rejects the request.
 
 For example, a project-local `opencode.json` can request confirmation for edits
 and shell commands:
@@ -96,9 +99,12 @@ and shell commands:
 
 ### Edited files
 
-The package gathers paths from streamed write, edit, and shell tool calls. Once
-the turn becomes idle, it reverts every unmodified live buffer visiting a
-touched path. Disable this safety net when another mechanism owns refresh:
+The package gathers paths from completed mutating tool calls. Once that
+session becomes idle, it reverts every unmodified live buffer visiting a
+touched path. Buffers with unsaved edits are never overwritten and are reported
+as skipped. Shell-command path guessing is disabled by default because it
+cannot reliably identify every file a command changed. Disable the refresh
+safety net when another mechanism owns it:
 
 ```elisp
 (setq oc-hp-revert-mode nil)
@@ -110,15 +116,14 @@ The frame title is `OpenCode Prompt`; title-only matching avoids XWayland class
 casing differences:
 
 ```conf
-windowrulev2 = float, title:^(OpenCode Prompt)$
-windowrulev2 = size 650 380, title:^(OpenCode Prompt)$
-windowrulev2 = center, title:^(OpenCode Prompt)$
+windowrule = float on, size 650 380, center on, match:title ^(OpenCode Prompt)$
 ```
 
-Without this rule, the package resolves the new frame's Hyprland address by
-title and floats that address. It never floats whichever window happens to be
-active—a race that can target the original Emacs frame under XWayland. Disable
-the runtime fallback with:
+Without this rule, the package snapshots Hyprland's clients before frame
+creation and assigns the newly appearing address to that specific frame. This
+also distinguishes several popup frames with the same title. It never floats
+whichever window happens to be active—a race that can target the original
+Emacs frame under XWayland. Disable the runtime fallback with:
 
 ```elisp
 (setq oc-hp-popup-float-on-hyprland nil)
@@ -134,14 +139,14 @@ the runtime fallback with:
 | `oc-hp-popup-default-model` | `nil` | Preferred `provider/model` in the picker |
 | `oc-hp-server-port` | `nil` | Spawn a server; a number attaches instead |
 | `oc-hp-server-password` | `nil` | `OPENCODE_SERVER_PASSWORD` for Basic auth |
-| `oc-hp-permission-default-yes` | `"once"` | `once` or `always` for an affirmative reply |
 | `oc-hp-revert-mode` | `t` | Refresh buffers touched during a turn |
 | `oc-hp-display-divider` | `"─── assistant ───"` | Prompt/response divider |
 
 ## Verify
 
-Run the deterministic state, buffer-pool, and directory-safety suites plus a
-real `opencode serve` transport smoke test (no model request or quota):
+Run the ERT protocol and failure-injection regressions, deterministic state,
+buffer-pool, and directory-safety suites, plus a real `opencode serve`
+transport smoke test (no model request or quota):
 
 ```sh
 ./tests/run-batch.sh
@@ -153,5 +158,6 @@ permission, revert, and two-turn scenarios remain available through
 loading `tests/opencode-hyprland-popup-tests.el`; their prompts state the exact
 acceptance evidence.
 
-The tested 1.17.11 server emits v1 `message.part.*` events. The display routes
-those events by `part.type` and retains v2 hooks for forward compatibility.
+The suite is exercised on Emacs 28.2 and 30.2. OpenCode 1.17.18 emits
+`message.part.updated` and `message.part.delta`; tests use the same string IDs,
+ordered part updates, tool-state shape, and error events as that server.

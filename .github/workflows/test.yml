@@ -1,0 +1,27 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  emacs:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        emacs-version: ["28.2", "30.2"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: purcell/setup-emacs@v8.0
+        with:
+          version: ${{ matrix.emacs-version }}
+      - name: Byte compile
+        run: emacs --batch -Q -L . -f batch-byte-compile *.el
+      - name: Test
+        env:
+          OC_HP_SKIP_INTEGRATION: "1"
+        run: ./tests/run-batch.sh
