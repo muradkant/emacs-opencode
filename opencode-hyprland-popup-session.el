@@ -4,8 +4,9 @@
 ;; SPDX-License-Identifier: MIT
 
 ;; Author: muradkant
-;; Version: 0.1.0
-;; Package-Requires: ((emacs "27.1"))
+;; Version: 0.2.0
+;; Package-Requires: ((emacs "28.1"))
+;; URL: https://github.com/muradkant/emacs-oc
 
 ;;; Commentary:
 
@@ -105,7 +106,8 @@ JSON.  Signals on HTTP/network error."
   (let* ((url (concat (oc-hp-server-url) path))
          (headers (append (oc-hp-server-auth-headers)
                           (when directory
-                            `(("x-opencode-directory" . ,directory))))))
+                            `(("x-opencode-directory" .
+                               ,(url-hexify-string directory)))))))
     (when body
       (setq headers (cons '("Content-Type" . "application/json") headers)))
     (let* ((url-request-method method)
@@ -118,7 +120,7 @@ JSON.  Signals on HTTP/network error."
           (with-current-buffer buf
             (goto-char url-http-end-of-headers)
             (let ((status (/ (or url-http-response-status 0) 100)))
-              (unless (or (= status 2) (= status 3))
+              (unless (= status 2)
                 (let ((err-body (buffer-substring-no-properties
                                  (point) (point-max))))
                   (error "HTTP %s %s: status %d body=%s"
@@ -135,7 +137,7 @@ JSON.  Signals on HTTP/network error."
 Uses alists internally because `json-encode' mis-detects nested plists
 inside arrays — `((:type \"text\" :text \"hi\"))' would be encoded as
 an OBJECT rather than an ARRAY of objects (verified live against
-OpenCode 1.17.11 — prompt_async returned 400 with
+OpenCode 1.17.18 — prompt_async returned 400 with
 `Expected array, got {\"type\":[\"text\",\"text\",...]}`)."
   (encode-coding-string
    (let ((json-object-type 'alist)
@@ -288,10 +290,14 @@ machine-local credentials are reflected without hardcoding model names."
                               nil directory)
       '()))
 
+(defun oc-hp-session-statuses (&optional directory)
+  "Return the server's session-ID to status mapping for DIRECTORY."
+  (or (oc-hp-session--request "GET" "/session/status" nil directory) '()))
+
 (defun oc-hp-session-prompt-async (session-id prompt &optional directory model variant)
   "Send PROMPT (a string) to SESSION-ID as a new turn via `prompt_async'.
-Body shape verified against OpenCode v1.17.11 source:
-`{parts:[{type:\"text\", text:<prompt>}]}' (RESEARCH §13.1).
+Body shape verified against OpenCode v1.17.18 source:
+`{parts:[{type:\"text\", text:<prompt>}]}'.
 Returns non-nil on 204.  No body returned."
   (let ((body (list :parts (list (list :type "text" :text prompt)))))
     (when model
@@ -315,9 +321,7 @@ Returns non-nil on 204.  No body returned."
                                       &optional directory)
   "Reply to a permission ask: RESPONSE for PERMISSION-ID in SESSION-ID.
 RESPONSE is one of the strings `once', `always', `reject' (the
-PermissionV1.Reply literals — RESEARCH §13.2).  Phase 7 calls this after
-a `y-or-n-p' in the popup's minibuffer, defaulting `once' on yes and
-`reject' on no."
+PermissionV1.Reply literals).  The permission UI offers each explicitly."
   (oc-hp-session--request "POST"
                           (format "/session/%s/permissions/%s"
                                   session-id permission-id)
@@ -339,7 +343,7 @@ a `y-or-n-p' in the popup's minibuffer, defaulting `once' on yes and
 
 (defun oc-hp-session--updated-time (session)
   "Return the updated time of SESSION as seconds since epoch (float), or nil.
-Handles OpenCode's `time.updated' shapes observed live in 1.17.11:
+Handles OpenCode's `time.updated' shapes observed live in 1.17.18:
 epoch *milliseconds* (a large number), epoch seconds, or an ISO-8601 string."
   (let* ((time (plist-get session :time))
          (updated (or (and time (plist-get time :updated))

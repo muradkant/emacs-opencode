@@ -4,8 +4,9 @@
 ;; SPDX-License-Identifier: MIT
 
 ;; Author: muradkant
-;; Version: 0.1.0
-;; Package-Requires: ((emacs "27.1"))
+;; Version: 0.2.0
+;; Package-Requires: ((emacs "28.1"))
+;; URL: https://github.com/muradkant/emacs-oc
 
 ;;; Commentary:
 
@@ -237,7 +238,7 @@ model plist, or nil if the user aborts."
 
 (defun oc-hp-picker--message-count (session)
   "Return the number of messages in SESSION, or '-' if unknown.
-OpenCode 1.17.11 doesn't expose a count on /session, so we return '-'
+OpenCode 1.17.18 doesn't expose a count on /session, so we return '-'
 unless a count appears on the session plist (e.g. a richer future API)."
   (let ((n (or (plist-get session :messages)
                (plist-get session :messageCount)

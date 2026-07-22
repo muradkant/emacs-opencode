@@ -5,8 +5,9 @@
 ;; SPDX-License-Identifier: MIT
 
 ;; Author: muradkant
-;; Version: 0.1.0
-;; Package-Requires: ((emacs "27.1"))
+;; Version: 0.2.0
+;; Package-Requires: ((emacs "28.1"))
+;; URL: https://github.com/muradkant/emacs-oc
 
 ;;; Commentary:
 
@@ -199,21 +200,17 @@ Matches `listening on http://HOST:PORT' or any `http://HOST:PORT' in the log."
             (oc-hp-server--debug "srv| %s" line)
             (oc-hp-server--try-parse-port line)))))))
 
-(defun oc-hp-server--process-sentinel (_process event)
+(defun oc-hp-server--process-sentinel (process event)
   "Handle the server process changing state."
-  (let ((s (string-trim event)))
+  (let* ((s (string-trim event))
+         (failed (not (zerop (process-exit-status process)))))
     (oc-hp-server--debug "sentinel: %s" s)
-    (cond
-     ((string-match-p "finished\\|exited" s)
-      (setq oc-hp-server--status 'disconnected
-            oc-hp-server--process nil)
-      (run-hooks 'oc-hp-server-disconnected-hook))
-     ((string-match-p "killed\\|signal\\|abnormal\\|connection broken" s)
-      (setq oc-hp-server--status 'error
-            oc-hp-server--process nil)
-      (run-hooks 'oc-hp-server-disconnected-hook)
-      (when (and oc-hp-server-auto-restart oc-hp-server--managed-p)
-        (oc-hp-server--schedule-restart))))))
+    (setq oc-hp-server--status (if failed 'error 'disconnected)
+          oc-hp-server--process nil
+          oc-hp-server--port nil)
+    (run-hooks 'oc-hp-server-disconnected-hook)
+    (when (and failed oc-hp-server-auto-restart oc-hp-server--managed-p)
+      (oc-hp-server--schedule-restart))))
 
 (defun oc-hp-server--schedule-restart ()
   "Arm a one-shot restart timer."
@@ -231,7 +228,9 @@ Matches `listening on http://HOST:PORT' or any `http://HOST:PORT' in the log."
   (condition-case err
       (oc-hp-server-start)
     (error
-     (oc-hp-server--debug "restart failed: %s" (error-message-string err)))))
+     (oc-hp-server--debug "restart failed: %s" (error-message-string err))
+     (when (and oc-hp-server-auto-restart oc-hp-server--managed-p)
+       (oc-hp-server--schedule-restart)))))
 
 ;;; --- Health check ---
 
@@ -310,6 +309,13 @@ we merely health-check the existing server at that port; no process is owned."
   (setq oc-hp-server--managed-p t)
   (let* ((args (append oc-hp-server-args
                        (list "--hostname" oc-hp-server-host)))
+         (process-environment
+          (append (when oc-hp-server-password
+                    (list (concat "OPENCODE_SERVER_PASSWORD="
+                                  oc-hp-server-password)
+                          (concat "OPENCODE_SERVER_USERNAME="
+                                  oc-hp-server-username)))
+                  process-environment))
          (proc (apply #'start-process
                       "oc-hp-server" nil
                       oc-hp-server-command args)))

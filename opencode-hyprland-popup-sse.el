@@ -5,8 +5,9 @@
 ;; SPDX-License-Identifier: MIT
 
 ;; Author: muradkant
-;; Version: 0.1.0
-;; Package-Requires: ((emacs "27.1"))
+;; Version: 0.2.0
+;; Package-Requires: ((emacs "28.1"))
+;; URL: https://github.com/muradkant/emacs-oc
 
 ;;; Commentary:
 
@@ -103,14 +104,15 @@ The brief's turn-complete signal is `session.status' with status type
 (defvar oc-hp-sse-session-compacted-hook nil
   "Hook run on `session.compacted'.")
 
-;; v1 message.* events — kept for parity; Phase 5 will decide whether
-;; the live 1.17.11 stream uses these or the v2 session.next.* set.
+;; OpenCode 1.17.18 message events.
 (defvar oc-hp-sse-message-updated-hook nil
   "Hook run on `message.updated'.")
 (defvar oc-hp-sse-message-removed-hook nil
   "Hook run on `message.removed'.")
 (defvar oc-hp-sse-message-part-updated-hook nil
-  "Hook run on `message.part.updated' (alias: `.delta').")
+  "Hook run on `message.part.updated'.")
+(defvar oc-hp-sse-message-part-delta-hook nil
+  "Hook run on `message.part.delta'.")
 (defvar oc-hp-sse-message-part-removed-hook nil
   "Hook run on `message.part.removed'.")
 
@@ -277,6 +279,16 @@ a bus event, so processing both would double-fire every handler."
         (json-null        nil))
     (json-read-from-string string)))
 
+(defun oc-hp-sse--run-hook-safely (hook event)
+  "Run each function on HOOK with EVENT, isolating handler failures."
+  (dolist (fn (and (boundp hook) (symbol-value hook)))
+    (when (functionp fn)
+      (condition-case err
+          (funcall fn event)
+        (error
+         (oc-hp-sse--debug "hook %s (%S) failed: %s"
+                           hook fn (error-message-string err)))))))
+
 (defun oc-hp-sse--run-hooks (event)
   "Run the catch-all hook and the type-specific hook for EVENT."
   (let ((type (plist-get event :type)))
@@ -285,9 +297,9 @@ a bus event, so processing both would double-fire every handler."
                       (plist-get event :directory)
                       (and (plist-get event :properties)
                            (map-keys (plist-get event :properties))))
-    (run-hook-with-args 'oc-hp-sse-event-hook event)
+    (oc-hp-sse--run-hook-safely 'oc-hp-sse-event-hook event)
     (when-let ((hook (oc-hp-sse--hook-for-type type)))
-      (run-hook-with-args hook event))))
+      (oc-hp-sse--run-hook-safely hook event))))
 
 (defconst oc-hp-sse--type->hook
   '(("server.connected"              . oc-hp-sse-server-connected-hook)
@@ -304,7 +316,7 @@ a bus event, so processing both would double-fire every handler."
     ("message.updated"              . oc-hp-sse-message-updated-hook)
     ("message.removed"             . oc-hp-sse-message-removed-hook)
     ("message.part.updated"         . oc-hp-sse-message-part-updated-hook)
-    ("message.part.delta"          . oc-hp-sse-message-part-updated-hook)
+    ("message.part.delta"          . oc-hp-sse-message-part-delta-hook)
     ("message.part.removed"         . oc-hp-sse-message-part-removed-hook)
     ;; v2 session.next.* — Phase 5 will confirm which these map to.
     ("session.next.reasoning.started" . oc-hp-sse-session-next-reasoning-hook)
@@ -451,7 +463,7 @@ already connected first disconnects."
           (cl-loop for (k . v) in auth-headers
                    append (list "-H" (format "%s: %s" k v))))
          (curl-args
-          (append (list "-s" "-N"
+          (append (list "--silent" "--show-error" "--fail" "--no-buffer"
                         "-H" "Accept: text/event-stream"
                         "-H" "Cache-Control: no-cache")
                   header-args
@@ -459,7 +471,10 @@ already connected first disconnects."
     (setq oc-hp-sse--url url
           oc-hp-sse--auth-headers auth-headers)
     (oc-hp-sse--debug "connecting to %s" url)
-    (oc-hp-sse--debug "curl args: %S" curl-args)
+    (oc-hp-sse--debug "curl auth headers: %S"
+                      (mapcar (lambda (header)
+                                (cons (car header) "<redacted>"))
+                              auth-headers))
     (condition-case err
         (let ((proc (apply #'start-process
                             "oc-hp-sse" nil

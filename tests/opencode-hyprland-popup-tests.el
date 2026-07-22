@@ -11,7 +11,7 @@
 ;; Each command opens the popup and prints acceptance steps to *Messages*:
 ;;   M-x oc-hp-test-phase5-streaming    live three-phase display (Phase 5)
 ;;   M-x oc-hp-test-phase6-picker       project session picker (Phase 6)
-;;   M-x oc-hp-test-phase7-permission   y-or-n-p in popup minibuffer (Phase 7)
+;;   M-x oc-hp-test-phase7-permission   permission choice in popup minibuffer
 ;;   M-x oc-hp-test-phase8-revert       revert a buffer OpenCode wrote (Phase 8)
 ;;   M-x oc-hp-test-phase9-two-turn     two-turn [q2 a2] not stacked (Phase 9)
 
@@ -41,12 +41,14 @@
         (when (file-exists-p f) (load f nil t))))
     (message "----- batch: transport smoke -----")
     (let ((smoke-ok
-           (condition-case e
-               (unwind-protect (oc-hp-smoke--run)
-                 (oc-hp-smoke--teardown))
-             (error
-              (message "smoke error: %s" (error-message-string e))
-              nil))))
+           (if (getenv "OC_HP_SKIP_INTEGRATION")
+               (progn (message "----- batch: transport smoke skipped -----") t)
+             (condition-case e
+                 (unwind-protect (oc-hp-smoke--run)
+                   (oc-hp-smoke--teardown))
+               (error
+                (message "smoke error: %s" (error-message-string e))
+                nil)))))
     (message "----- batch: phase9 (follow-up FSM) -----")
     (oc-hp-phase9-run)
     (message "----- batch: phase10 (buffer pool) -----")
@@ -94,10 +96,10 @@
   (opencode-hyprland-popup-prompt))
 
 (defun oc-hp-test-phase7-permission ()
-  "Phase 7: prompt a tool that hits an ask rule; expect a y-or-n-p."
+  "Prompt a tool that hits an ask rule; expect an explicit choice."
   (interactive)
   (oc-hp-test--banner
-   '("PHASE 7 — permission y-or-n-p in the popup's own minibuffer"
+   '("PERMISSION — explicit choice in the popup's own minibuffer"
      "PREP: make OpenCode ASK for a tool. Easiest sandboxed way: in a"
      "THROWAWAY project dir create ./opencode.json with an ask rule, e.g.:"
      "  { \"permission\": { \"edit\": \"ask\", \"bash\": \"ask\" } }"
@@ -108,9 +110,8 @@
      "     create a file ./touched.txt with contents 'hi'"
      "3. Press :w."
      "ACCEPTANCE:"
-     "  * A yes/no prompt appears IN THE POPUP FRAME's own minibuffer."
-     "  * y -> approve once (turn proceeds); n -> reject (turn aborts)."
-     "  * C-u y would approve always (persisting the rule)."))
+     "  * A choice appears IN THE POPUP FRAME's own minibuffer."
+     "  * o -> approve once; a -> approve always; r -> reject."))
   (opencode-hyprland-popup-prompt))
 
 (defun oc-hp-test-phase8-revert ()

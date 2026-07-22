@@ -4,15 +4,14 @@
 ;; SPDX-License-Identifier: MIT
 
 ;; Author: muradkant
-;; Version: 0.1.0
-;; Package-Requires: ((emacs "27.1"))
+;; Version: 0.2.0
+;; Package-Requires: ((emacs "28.1"))
+;; URL: https://github.com/muradkant/emacs-oc
 
 ;;; Commentary:
 
-;; Phase 5 three-phase display for opencode-hyprland-popup, keyed on the
-;; v1 event stream emitted by OpenCode 1.17.11 (see RESEARCH §13.7 — the
-;; live server emits `message.part.*` events, not the v2 `session.next.*'
-;; the dev branch schema describes).
+;; Three-stage display for the `message.part.*' event stream emitted by
+;; OpenCode 1.17.18.
 ;;
 ;; Buffer layout during a turn:
 ;;
@@ -71,16 +70,14 @@
   "Marker at the divider line, start of the ephemeral region.")
 (defvar-local oc-hp-display--eph-end nil
   "Marker at end of the ephemeral region (advances as we insert).")
+(defvar-local oc-hp-display--parts nil
+  "Complete OpenCode parts for this turn, in first-seen order.")
 (defvar-local oc-hp-display--text-by-part nil
-  "Alist of partID -> ordered (index . final-text) for `text' parts.
-Insertion-ordered list of `(partID . final-text)' pairs; on idle we
-concatenate them in insertion order to form the answer.")
-(defvar-local oc-hp-display--tools nil
-  "Accumulated tool-call summaries (string list) shown in the ephemeral region.")
-(defvar-local oc-hp-display--reasoning nil
-  "Accumulated reasoning text (string) shown in the ephemeral region.")
+  "Compatibility view of text parts used by older callers and tests.")
 (defvar-local oc-hp-display--finalized nil
-  "Non-nil once the turn has finalized (Phase 2) — prevents double-finalize.")
+  "Non-nil once the turn has finalized, preventing double finalization.")
+(defvar-local oc-hp-display--error nil
+  "Human-readable error for the current turn, or nil.")
 
 (defvar oc-hp-display--handlers-attached nil
   "Non-nil once we've added the SSE event handlers globally.")
@@ -94,6 +91,8 @@ concatenate them in insertion order to form the answer.")
   "Defined in opencode-hyprland-popup.el; declared here for free-use warnings.")
 (defvar oc-hp-popup-directory nil
   "Defined in opencode-hyprland-popup.el; declared here for free-use warnings.")
+(defvar oc-hp-popup-session-id nil
+  "Defined in opencode-hyprland-popup.el; declared here for reconciliation.")
 
 (defun oc-hp-display--buffer ()
   "Return the popup buffer for the active display turn, or nil.
@@ -143,11 +142,12 @@ the user's prompt text MUST already be in the buffer above point."
       (set-marker-insertion-type oc-hp-display--eph-start t))
     ;; Ephemeral end marker starts just after divider; advances with inserts
     (setq-local oc-hp-display--eph-end (copy-marker (point) t))
-    (setq-local oc-hp-display--text-by-part nil
-                oc-hp-display--tools nil
-                oc-hp-display--reasoning nil
-                oc-hp-display--finalized nil)
+    (setq-local oc-hp-display--parts nil
+                oc-hp-display--text-by-part nil
+                oc-hp-display--finalized nil
+                oc-hp-display--error nil)
     (setq-local oc-hp-popup-phase 1)
+    (setq-local buffer-read-only t)
     ;; Attach SSE handlers once, globally (popup buffers switch over time)
     (oc-hp-display--attach-handlers)
     (oc-hp-display--render-ephemeral)))
@@ -159,16 +159,20 @@ the user's prompt text MUST already be in the buffer above point."
   (unless oc-hp-display--handlers-attached
     (add-hook 'oc-hp-sse-message-updated-hook #'oc-hp-display--handle-message-updated)
     (add-hook 'oc-hp-sse-message-part-updated-hook #'oc-hp-display--handle-part-updated)
-    (add-hook 'oc-hp-sse-message-part-updated-hook #'oc-hp-display--handle-part-delta)
+    (add-hook 'oc-hp-sse-message-part-delta-hook #'oc-hp-display--handle-part-delta)
     (add-hook 'oc-hp-sse-session-status-hook #'oc-hp-display--handle-status)
+    (add-hook 'oc-hp-sse-session-error-hook #'oc-hp-display--handle-error)
+    (add-hook 'oc-hp-sse-server-connected-hook #'oc-hp-display--reconcile)
     (setq oc-hp-display--handlers-attached t)))
 
 (defun oc-hp-display--detach-handlers ()
   "Detach (for cleanup / test)."
   (remove-hook 'oc-hp-sse-message-updated-hook #'oc-hp-display--handle-message-updated)
   (remove-hook 'oc-hp-sse-message-part-updated-hook #'oc-hp-display--handle-part-updated)
-  (remove-hook 'oc-hp-sse-message-part-updated-hook #'oc-hp-display--handle-part-delta)
+  (remove-hook 'oc-hp-sse-message-part-delta-hook #'oc-hp-display--handle-part-delta)
   (remove-hook 'oc-hp-sse-session-status-hook #'oc-hp-display--handle-status)
+  (remove-hook 'oc-hp-sse-session-error-hook #'oc-hp-display--handle-error)
+  (remove-hook 'oc-hp-sse-server-connected-hook #'oc-hp-display--reconcile)
   (setq oc-hp-display--handlers-attached nil))
 
 (defun oc-hp-display--handle-message-updated (event)
@@ -222,36 +226,48 @@ the user's prompt text MUST already be in the buffer above point."
       (pcase type
         ("step-start"  nil)            ; boundary; rendering handled by tool/text themselves
         ("step-finish" nil)            ; finalizer; we render answer cumulatively (cost footer optional)
-        ("text"
-         (let ((text (or (plist-get part :text) "")))
-           (oc-hp-display--record-text pid text)))
-        ("reasoning"
-         (let ((text (or (plist-get part :text) "")))
-           (when (and text (not (string-empty-p text)))
-             (setq-local oc-hp-display--reasoning
-                         (concat oc-hp-display--reasoning text))
-             (oc-hp-display--render-ephemeral))))
-        ("tool"
-         (let* ((name (plist-get part :tool))
-                (input (plist-get part :input))
-                (summary (oc-hp-display--summarize-tool-call name input)))
-           (push (cons pid summary) oc-hp-display--tools)
-           (oc-hp-display--render-ephemeral)))
+        ((or "text" "reasoning" "tool")
+         (oc-hp-display--put-part pid part)
+         (oc-hp-display--render-ephemeral))
         (_ nil)))))
 
 (defun oc-hp-display--on-part-delta (event)
   "Append a streaming text delta."
   (let* ((props (plist-get event :properties))
          (pid (plist-get props :partID))
-         (delta (plist-get props :delta)))
+         (field (plist-get props :field))
+         (delta (plist-get props :delta))
+         (part (oc-hp-display--part pid)))
     (when (and (oc-hp-display--assistant-event-p event)
                pid delta
                (not (string-empty-p delta))
-               (assq pid oc-hp-display--text-by-part))
-      ;; Update final-text for the in-progress text part
-      (setcdr (assq pid oc-hp-display--text-by-part)
-              (concat (cdr (assq pid oc-hp-display--text-by-part)) delta))
+               part
+               (member field '(nil "text")))
+      (plist-put part :text (concat (or (plist-get part :text) "") delta))
+      (oc-hp-display--sync-text-view)
       (oc-hp-display--render-ephemeral))))
+
+(defun oc-hp-display--part (pid)
+  "Return the current part whose ID equals PID."
+  (cl-find pid oc-hp-display--parts
+           :key (lambda (part) (plist-get part :id)) :test #'equal))
+
+(defun oc-hp-display--put-part (pid part)
+  "Insert or replace PART identified by PID without changing its order."
+  (let ((existing (oc-hp-display--part pid)))
+    (if existing
+        (setcar (memq existing oc-hp-display--parts) part)
+      (setq-local oc-hp-display--parts
+                  (append oc-hp-display--parts (list part)))))
+  (oc-hp-display--sync-text-view))
+
+(defun oc-hp-display--sync-text-view ()
+  "Refresh the compatibility text-part alist from current part state."
+  (setq-local oc-hp-display--text-by-part
+              (cl-loop for part in oc-hp-display--parts
+                       when (equal (plist-get part :type) "text")
+                       collect (cons (plist-get part :id)
+                                     (or (plist-get part :text) "")))))
 
 (defun oc-hp-display--assistant-event-p (event)
   "Return non-nil when EVENT belongs to an assistant message.
@@ -290,27 +306,84 @@ that part under the assistant divider makes the popup show a fake answer."
       (oc-hp-display--in-popup-for event
         (lambda (buf) (oc-hp-display--finalize buf))))))
 
+(defun oc-hp-display--handle-error (event)
+  "Make a `session.error' EVENT visible in its session buffer."
+  (oc-hp-display--in-popup-for
+   event
+   (lambda (buf)
+     (with-current-buffer buf
+       (let* ((props (plist-get event :properties))
+              (err (plist-get props :error))
+              (message (or (and (listp err) (plist-get err :message))
+                           (and (listp err)
+                                (plist-get (plist-get err :data) :message))
+                           (and (stringp err) err)
+                           "OpenCode reported an unknown session error")))
+         (setq-local oc-hp-display--error message)
+         (oc-hp-display--render-ephemeral))))))
+
+(defun oc-hp-display--reconcile (_event)
+  "Reconcile streaming popup buffers after an SSE connection is established."
+  (dolist (buf (buffer-list))
+    (when (and (buffer-live-p buf)
+               (with-current-buffer buf
+                 (and (derived-mode-p 'opencode-hyprland-popup-mode)
+                      (eq oc-hp-popup-phase 1))))
+      (with-current-buffer buf
+        (condition-case err
+            (let* ((statuses (oc-hp-session-statuses oc-hp-popup-directory))
+                   (status (plist-get statuses
+                                      (intern (concat ":" oc-hp-popup-session-id))))
+                   (type (plist-get status :type)))
+              (unless (member type '("busy" "retry"))
+                (let* ((messages (oc-hp-session-messages
+                                  oc-hp-popup-session-id oc-hp-popup-directory))
+                       (assistant
+                        (cl-find-if
+                         (lambda (message)
+                           (equal (plist-get (or (plist-get message :info)
+                                                message)
+                                             :role)
+                                  "assistant"))
+                         (reverse messages))))
+                  (when assistant
+                    (setq-local oc-hp-display--parts
+                                (cl-remove-if-not
+                                 (lambda (part)
+                                   (member (plist-get part :type)
+                                           '("text" "reasoning" "tool")))
+                                 (plist-get assistant :parts)))
+                    (oc-hp-display--sync-text-view))
+                  (oc-hp-display--finalize buf))))
+          (error
+           (message "OpenCode: could not reconcile session %s: %s"
+                    oc-hp-popup-session-id (error-message-string err))))))))
+
 ;;; --- Final answer assemblage & commit ---
 
 (defun oc-hp-display--record-text (pid text)
   "Note/update a `text' part.  Empty on first sighting, grows per `.updated'."
-  (if (assq pid oc-hp-display--text-by-part)
-      (setcdr (assq pid oc-hp-display--text-by-part) text)
-    (push (cons pid text) oc-hp-display--text-by-part))
+  (oc-hp-display--put-part pid (list :id pid :type "text" :text text))
   (oc-hp-display--render-ephemeral))
 
 (defun oc-hp-display--summarize-tool-call (name input)
   "Format a tool-name + truncated args line for the ephemeral region."
-  (let* ((arg-str (if (listp input)
-                      (mapconcat (lambda (kv)
-                                   (format "%s=%s" (car kv)
-                                           (let ((v (if (listp (cdr kv)) (cdr kv) (cdr kv))))
-                                             (cond
-                                              ((stringp v)
-                                               (substring v 0 (min 60 (length v))))
-                                              ((null v) "—")
-                                              (t (format "%S" v))))))
-                                 input " ")
+  (let* ((pairs (when (and (listp input) (keywordp (car input)))
+                  (let ((rest input) result)
+                    (while rest
+                      (push (cons (pop rest) (pop rest)) result))
+                    (nreverse result))))
+         (arg-str (if pairs
+                      (mapconcat
+                       (lambda (pair)
+                         (let ((value (cdr pair)))
+                           (format "%s=%s" (substring (symbol-name (car pair)) 1)
+                                   (cond
+                                    ((stringp value)
+                                     (substring value 0 (min 60 (length value))))
+                                    ((null value) "—")
+                                    (t (format "%S" value))))))
+                       pairs " ")
                     (format "%S" input)))
          (out (format "[%s: %s]" (or name "?") arg-str)))
     (if (> (length out) 120) (concat (substring out 0 117) "...]") out)))
@@ -330,18 +403,33 @@ that part under the assistant divider makes the popup show a fake answer."
         (delete-region (point) oc-hp-display--eph-end)
         ;; Build the ephemeral content
         (let ((lines nil))
-          (when (and oc-hp-display--reasoning
-                     (not (string-empty-p oc-hp-display--reasoning)))
-            (push (propertize (concat "* " oc-hp-display--reasoning)
-                              'face 'oc-hp-display-ephemeral-face)
+          (dolist (part oc-hp-display--parts)
+            (let ((text (or (plist-get part :text) "")))
+              (pcase (plist-get part :type)
+                ("reasoning"
+                 (unless (string-empty-p text)
+                   (push (propertize (concat "* " text)
+                                     'face 'oc-hp-display-ephemeral-face)
+                         lines)))
+                ("tool"
+                 (let* ((state (plist-get part :state))
+                        (summary (oc-hp-display--summarize-tool-call
+                                  (plist-get part :tool)
+                                  (plist-get state :input)))
+                        (status (plist-get state :status)))
+                   (push (propertize
+                          (format "%s%s" summary
+                                  (if status (format " [%s]" status) ""))
+                          'face 'oc-hp-display-tool-face)
+                         lines)))
+                ("text"
+                 (unless (string-empty-p text)
+                   (push (propertize text 'face 'oc-hp-display-answer-face)
+                         lines))))))
+          (when oc-hp-display--error
+            (push (propertize (format "[error: %s]" oc-hp-display--error)
+                              'face 'error)
                   lines))
-          (dolist (tool (nreverse (mapcar #'cdr oc-hp-display--tools)))
-            (push (propertize tool 'face 'oc-hp-display-tool-face) lines))
-          (when oc-hp-display--text-by-part
-            (let ((live
-                   (mapconcat #'cdr (nreverse oc-hp-display--text-by-part) "\n\n")))
-              (push (propertize live 'face 'oc-hp-display-answer-face)
-                    lines)))
           (when lines
             (insert (mapconcat #'identity (nreverse lines) "\n") "\n")))
         (dolist (m (list oc-hp-display--eph-end))
@@ -359,13 +447,24 @@ that part under the assistant divider makes the popup show a fake answer."
           (forward-line 1)               ; skip the divider
           (delete-region (point) (point-max))
           (let ((answer
-                 (mapconcat #'cdr (nreverse oc-hp-display--text-by-part) "\n\n")))
+                 (mapconcat
+                  (lambda (part) (or (plist-get part :text) ""))
+                  (cl-remove-if-not
+                   (lambda (part) (equal (plist-get part :type) "text"))
+                   oc-hp-display--parts)
+                  "\n\n")))
             (insert (propertize answer 'face 'oc-hp-display-answer-face))
+            (when oc-hp-display--error
+              (unless (string-empty-p answer) (insert "\n\n"))
+              (insert (propertize (format "[OpenCode error: %s]"
+                                          oc-hp-display--error)
+                                  'face 'error)))
             (insert "\n"))
           (set-marker oc-hp-display--eph-start nil)
           (set-marker oc-hp-display--eph-end nil)
           (setq-local oc-hp-display--finalized t)
           (setq-local oc-hp-popup-phase 2)
+          (setq-local buffer-read-only nil)
           (goto-char (point-max))
           (insert "\n")
           ;; Phase 9: anchor so the next :w extracts ONLY the follow-up
@@ -374,7 +473,9 @@ that part under the assistant divider makes the popup show a fake answer."
           ;; finalized region while the user types the new prompt after it.
           (setq-local oc-hp-popup-answer-end (copy-marker (point) nil))))))
   ;; notify user visually
-  (message "OpenCode: turn complete"))
+  (message (if (with-current-buffer buf oc-hp-display--error)
+               "OpenCode: turn failed"
+             "OpenCode: turn complete")))
 
 (provide 'opencode-hyprland-popup-display)
 ;;; opencode-hyprland-popup-display.el ends here

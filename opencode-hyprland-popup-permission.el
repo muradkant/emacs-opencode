@@ -4,22 +4,19 @@
 ;; SPDX-License-Identifier: MIT
 
 ;; Author: muradkant
-;; Version: 0.1.0
-;; Package-Requires: ((emacs "27.1"))
+;; Version: 0.2.0
+;; Package-Requires: ((emacs "28.1"))
+;; URL: https://github.com/muradkant/emacs-oc
 
 ;;; Commentary:
 
-;; Phase 7 of opencode-hyprland-popup.  When OpenCode's turn hits a
-;; per-tool `ask' permission rule (RESEARCH §13.2 / brief §3.8), the
+;; When OpenCode's turn hits a per-tool `ask' permission rule, the
 ;; server emits `permission.asked' on the SSE stream and pauses the turn
 ;; until we reply via POST /session/:id/permissions/:permissionID with
 ;; {"response":"once"|"always"|"reject"}.
 ;;
-;; We surface the ask as a `y-or-n-p' in the popup frame's own minibuffer
-;; (the reason `make-frame' was built with `(minibuffer . t)').  Yes ->
-;; "once" by default; `C-u` yes -> "always"; No -> "reject".  All
-;; OpenCode semantics are respected (we DO NOT modify the server's
-;; permission ruleset ourselves — see brief §2 philosophy).
+;; We queue the ask outside the SSE process filter and offer explicit
+;; once, always, and reject choices in the session popup's minibuffer.
 
 ;;; Code:
 
@@ -34,17 +31,20 @@
   :prefix "oc-hp-permission-")
 
 (defcustom oc-hp-permission-default-yes "once"
-  "Response to send when the user answers yes by default.
-One of `once' or `always'.  `once' is the conservative default
-(approve this one tool call); an `always' default would persist the
-rule, which slightly conflicts with brief §2 \"we don't modify
-OpenCode's permission rules\" — kept available but not the default."
+  "Obsolete affirmative default retained for configuration compatibility."
   :type '(choice (const :tag "Approve once (recommended)" "once")
                  (const :tag "Approve and persist as always" "always"))
   :group 'oc-hp-permission)
+(make-obsolete-variable 'oc-hp-permission-default-yes nil "0.2.0")
 
 (defvar oc-hp-permission--handlers-attached nil
   "Non-nil once SSE handlers are registered.")
+(defvar oc-hp-permission--queue nil
+  "Permission events waiting for user input.")
+(defvar oc-hp-permission--prompt-active nil
+  "Non-nil while a queued permission is being answered.")
+(defvar oc-hp-popup-frame nil
+  "Popup frame associated with the current session buffer.")
 
 (defun oc-hp-permission-attach ()
   "Register the `permission.asked' handler on the SSE hook (idempotent)."
@@ -59,37 +59,56 @@ OpenCode's permission rules\" — kept available but not the default."
 
 (defun oc-hp-permission--on-asked (event)
   "Prompt the user about EVENT (a `permission.asked' SSE event).
-EVENT's properties carry the request shape from
-`packages/schema/src/permission-v1.ts:27' (RESEARCH §13.2):
+EVENT's properties carry OpenCode's permission request shape:
   {id, sessionID, permission, patterns, metadata, always, tool?}.
-Defaults to the popup frame's own minibuffer when present; otherwise
-the current frame's."
+The request is queued for the matching popup frame when present."
   (let* ((props (plist-get event :properties))
          (request-id (plist-get props :id))
          (session-id (plist-get props :sessionID))
-         (permission (plist-get props :permission))
-         (patterns (plist-get props :patterns))
-         (tool (plist-get props :tool)))
+         (permission (plist-get props :permission)))
     (if (and session-id request-id permission)
-        (oc-hp-permission--raise-ask session-id request-id permission
-                                     patterns tool)
+        (progn
+          (setq oc-hp-permission--queue
+                (append oc-hp-permission--queue (list event)))
+          (run-at-time 0 nil #'oc-hp-permission--process-queue))
       (message "OpenCode permission: malformed event; skipping: %S" event))))
 
+(defun oc-hp-permission--process-queue ()
+  "Prompt for the next queued permission outside the SSE process filter."
+  (unless (or oc-hp-permission--prompt-active
+              (null oc-hp-permission--queue))
+    (setq oc-hp-permission--prompt-active t)
+    (let* ((event (pop oc-hp-permission--queue))
+           (props (plist-get event :properties)))
+      (unwind-protect
+          (oc-hp-permission--raise-ask
+           (plist-get props :sessionID) (plist-get props :id)
+           (plist-get props :permission) (plist-get props :patterns)
+           (plist-get props :tool) (plist-get event :directory))
+        (setq oc-hp-permission--prompt-active nil)
+        (when oc-hp-permission--queue
+          (run-at-time 0 nil #'oc-hp-permission--process-queue))))))
+
 (defun oc-hp-permission--raise-ask (session-id request-id permission
-                                              patterns tool)
-  "Pop a yes/no in the popup frame's minibuffer; reply to OpenCode.
-TOOL (an alist with :messageID and :callID) is shown for context.
-A plain yes answers `once'; a `C-u` yes answers `always'; no answers `reject'."
-  (let* ((prompt (oc-hp-permission--format permission patterns tool))
-         (answer
-          (condition-case _err
-              (if (y-or-n-p prompt)
-                  (if current-prefix-arg "always" oc-hp-permission-default-yes)
-                "reject")
-            (quit "reject"))))
+                                               patterns tool directory)
+  "Ask once/always/reject for a permission, then reply to OpenCode."
+  (let* ((prompt (concat (oc-hp-permission--format permission patterns tool)
+                         "[o]nce [a]lways [r]eject "))
+         (buf (get-buffer (format "*opencode-prompt<%s>*" session-id)))
+         (frame (and (buffer-live-p buf)
+                     (buffer-local-value 'oc-hp-popup-frame buf)))
+         (read-answer
+          (lambda ()
+            (condition-case nil
+                (pcase (read-char-choice prompt '(?o ?a ?r))
+                  (?o "once") (?a "always") (_ "reject"))
+              (quit "reject"))))
+         (answer (if (frame-live-p frame)
+                     (with-selected-frame frame (funcall read-answer))
+                   (funcall read-answer))))
     (condition-case err
         (progn
-          (oc-hp-session-reply-permission session-id request-id answer)
+          (oc-hp-session-reply-permission session-id request-id answer directory)
           (message "OpenCode permission: %s -> %s" permission answer))
       (error
        (message "OpenCode permission: reply failed: %s"

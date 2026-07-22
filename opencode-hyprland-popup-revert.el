@@ -4,25 +4,15 @@
 ;; SPDX-License-Identifier: MIT
 
 ;; Author: muradkant
-;; Version: 0.1.0
-;; Package-Requires: ((emacs "27.1"))
+;; Version: 0.2.0
+;; Package-Requires: ((emacs "28.1"))
+;; URL: https://github.com/muradkant/emacs-oc
 
 ;;; Commentary:
 
-;; Phase 8 of opencode-hyprland-popup.  When OpenCode's write/edit/patch
-;; or bash tools modify files on disk, Emacs buffers visiting those
-;; files won't auto-refresh unless `global-auto-revert-mode' is on (which
-;; we recommend — RESEARCH §6 decision §12.5).
-;;
-;; We collect candidate file paths from `tool' parts as they stream in
-;; (part.type == "tool", part.tool in {write,edit,apply_patch,read,
-;; str_replace,bash,...}, paths pulled from part.input), and after the
-;; turn finalizes (session.status idle) we revert every live buffer
-;; whose `buffer-file-name' matches a touched path.
-;;
-;; This is defensive: if `global-auto-revert-mode' is on, the explicit
-;; revert is a harmless no-op (the file's already current); if it's off,
-;; this is the only way the user sees the change without a manual revert.
+;; Completed mutating tool parts identify paths through `part.state.input'.
+;; When that session becomes idle, matching unmodified buffers are refreshed.
+;; Buffers with unsaved edits are deliberately left untouched.
 
 ;;; Code:
 
@@ -43,13 +33,13 @@
 
 (defcustom oc-hp-revert-tool-allowlist
   '("write" "edit" "apply_patch" "str_replace" "str_replace_editor"
-    "read" "bash" "multi_edit" "patch" "remove")
+    "bash" "multi_edit" "patch" "remove")
   "Tool names (lowercase strings) whose `input' paths we harvest for revert.
 Default is broad; trim if you only care about mutating tools."
   :type '(repeat string)
   :group 'oc-hp-revert)
 
-(defcustom oc-hp-revert-bash-grep-paths t
+(defcustom oc-hp-revert-bash-grep-paths nil
   "When non-nil, also scan bash command strings for paths in the working dir.
 Heuristic — bash tools pass a command, not a file path.  Off by default
 would skip bash (safer for noisy commands)."
@@ -57,7 +47,7 @@ would skip bash (safer for noisy commands)."
   :group 'oc-hp-revert)
 
 (defvar oc-hp-revert--touched (make-hash-table :test 'equal)
-  "Per-process hash of touched absolute file paths (value=t).")
+  "Map session IDs to hashes of touched absolute file paths.")
 (defvar oc-hp-revert--handlers-attached nil)
 
 (defun oc-hp-revert-attach ()
@@ -80,13 +70,22 @@ would skip bash (safer for noisy commands)."
            (part (plist-get props :part)))
       (when (and (listp part)
                  (equal (plist-get part :type) "tool"))
-        (let ((tool (plist-get part :tool))
-              (input (plist-get part :input))
-              (directory (plist-get (plist-get event :directory)
-                                    :directory)))  ; envelope's directory
-          (when (member tool oc-hp-revert-tool-allowlist)
-            (dolist (path (oc-hp-revert--extract-paths tool input directory))
-              (puthash path t oc-hp-revert--touched))))))))
+        (let* ((tool (plist-get part :tool))
+               (state (plist-get part :state))
+               (input (plist-get state :input))
+               (status (plist-get state :status))
+               (session-id (or (plist-get part :sessionID)
+                               (plist-get props :sessionID)))
+               (directory (plist-get event :directory)))
+          (when (and session-id
+                     (equal status "completed")
+                     (member tool oc-hp-revert-tool-allowlist))
+            (let ((paths (or (gethash session-id oc-hp-revert--touched)
+                             (let ((table (make-hash-table :test 'equal)))
+                               (puthash session-id table oc-hp-revert--touched)
+                               table))))
+              (dolist (path (oc-hp-revert--extract-paths tool input directory))
+                (puthash path t paths)))))))))
 
 (defun oc-hp-revert--extract-paths (tool input directory)
   "Return a list of absolute file paths OpenCode touched via TOOL with INPUT.
@@ -148,29 +147,31 @@ mean a file isn't auto-reverted (user can revert manually)."
            (status (plist-get props :status))
            (type (and (listp status) (plist-get status :type))))
       (when (equal type "idle")
-        (oc-hp-revert--flush)))))
+        (oc-hp-revert--flush (plist-get props :sessionID))))))
 
-(defun oc-hp-revert--flush ()
-  "Revert every live buffer visiting a path in `oc-hp-revert--touched'.
-Clears the hash after flushing."
-  (when (> (hash-table-count oc-hp-revert--touched) 0)
-    (let (reverted-files)
+(defun oc-hp-revert--flush (session-id)
+  "Safely refresh buffers touched by SESSION-ID, then clear its paths."
+  (when-let ((paths (gethash session-id oc-hp-revert--touched)))
+    (let (reverted-files skipped-files)
       (dolist (buf (buffer-list))
         (when (buffer-live-p buf)
           (let* ((file (buffer-file-name buf))
                  (abs (and file (expand-file-name file))))
-            (when (and abs (gethash abs oc-hp-revert--touched))
+            (when (and abs (gethash abs paths))
               (with-current-buffer buf
-                (if (fboundp 'revert-buffer-quick)
-                    (revert-buffer-quick :ignore-auto)
-                  (let ((autosave? (buffer-modified-p)))
-                    (revert-buffer :ignore-auto (not autosave?) :preserve-modes)))
-                (push abs reverted-files))))))      ; close with-current-buffer, when-abs, let*, when-buffer-live, dolist
-      (clrhash oc-hp-revert--touched)
+                (if (buffer-modified-p)
+                    (push abs skipped-files)
+                  (revert-buffer t t t)
+                  (push abs reverted-files)))))))
+      (remhash session-id oc-hp-revert--touched)
       (when reverted-files
         (message "OpenCode reverted %d buffer(s): %s"
                  (length reverted-files)
-                 (mapconcat #'identity reverted-files ", "))))))
+                 (mapconcat #'identity reverted-files ", ")))
+      (when skipped-files
+        (message "OpenCode left %d modified buffer(s) untouched: %s"
+                 (length skipped-files)
+                 (mapconcat #'identity skipped-files ", "))))))
 
 (provide 'opencode-hyprland-popup-revert)
 ;;; opencode-hyprland-popup-revert.el ends here

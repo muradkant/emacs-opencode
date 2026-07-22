@@ -4,12 +4,9 @@
 ;; SPDX-License-Identifier: MIT
 
 ;; Author: muradkant
-;; Version: 0.1.0
-;; Package-Requires: ((emacs "27.1"))
-
-;; Commentary: see RESEARCH.md and the build brief.  This is the main
-;; entrypoint file; transport (SSE), server lifecycle, and session HTTP
-;; live in sibling opencode-hyprland-popup-{sse,server,session}.el files.
+;; Version: 0.2.0
+;; Package-Requires: ((emacs "28.1"))
+;; URL: https://github.com/muradkant/emacs-oc
 
 ;;; Commentary:
 
@@ -27,7 +24,7 @@
 ;;   6. Hyprland floats the new frame imperatively via `hyprctl dispatch
 ;;      setfloating address:<addr>', where <addr> is resolved by matching
 ;;      the frame's title against `hyprctl clients -j' (the user may also
-;;      add a static title-only rule — see RESEARCH.md §3).  Address-
+;;      add the static title-only rule documented in README.md).  Address-
 ;;      targeting (NOT bare `setfloating', which floats the active window)
 ;;      avoids the focus race where the *original* Emacs window gets
 ;;      floated instead of the popup.
@@ -134,7 +131,6 @@ above it is what the user is currently writing.  -- used from Phase 9 onward.")
 
 (defvar opencode-hyprland-popup-mode-map (make-sparse-keymap)
   "Keymap for `opencode-hyprland-popup-mode'.")
-(define-key opencode-hyprland-popup-mode-map (kbd "q")       #'oc-hp-popup-quit)
 (define-key opencode-hyprland-popup-mode-map (kbd "C-c C-k") #'oc-hp-popup-quit)
 (define-key opencode-hyprland-popup-mode-map (kbd "C-c C-c") #'oc-hp-popup-send)
 (define-key opencode-hyprland-popup-mode-map (kbd "C-c h")
@@ -147,12 +143,15 @@ above it is what the user is currently writing.  -- used from Phase 9 onward.")
   "OC-Popup"
   "Major mode for the OpenCode Hyprland popup editor.
 The buffer is editable; Evil `:w' sends its contents as a prompt to the
-OpenCode session backing it (Phase 4).  `q'/`C-c C-k' dismiss the frame;
-the buffer is buried (not killed) for instant re-open (Phase 10).
+OpenCode session backing it.  Evil normal-state `q' or `C-c C-k' dismisses
+the frame; the buffer is buried rather than killed for instant re-open.
 \\{opencode-hyprland-popup-mode-map}"
   (setq-local truncate-lines nil)
   (setq-local window-point-insertion-type t)        ; stream-friendly (Phase 5)
-  (when (fboundp 'evil-local-mode) (evil-local-mode 1))
+  (when (fboundp 'evil-local-mode)
+    (evil-local-mode 1)
+    (when (fboundp 'evil-local-set-key)
+      (evil-local-set-key 'normal (kbd "q") #'oc-hp-popup-quit)))
   (oc-hp-popup--install-evil-write-override))
 
 ;;; --- Evil `:w' buffer-local override (brief §3.5 / RESEARCH §3c) ---
@@ -179,6 +178,21 @@ so without the copy the override would leak into every other buffer."
                        (oc-hp-server-auth-headers)))
   (oc-hp-permission-attach)              ; Phase 7: register permission.asked
   (oc-hp-revert-attach))                 ; Phase 8: reverts touched buffers
+
+(defun oc-hp-popup--server-connected ()
+  "Connect SSE to the current server URL after startup or restart."
+  (condition-case err
+      (oc-hp-sse-connect (oc-hp-server-url "/global/event")
+                         (oc-hp-server-auth-headers))
+    (error (message "OpenCode: SSE reconnect failed: %s"
+                    (error-message-string err)))))
+
+(defun oc-hp-popup--server-disconnected ()
+  "Stop the stale SSE transport when its server disappears."
+  (oc-hp-sse-disconnect))
+
+(add-hook 'oc-hp-server-connected-hook #'oc-hp-popup--server-connected)
+(add-hook 'oc-hp-server-disconnected-hook #'oc-hp-popup--server-disconnected)
 
 ;;; --- Session selection ---
 
@@ -259,7 +273,14 @@ Phase 1 (a turn still streaming) is refused to protect the display FSM."
   (let* ((session-id oc-hp-popup-session-id)
          (directory oc-hp-popup-directory)
          (follow-up-p (eq oc-hp-popup-phase 2))
-         (prompt (string-trim-right (oc-hp-popup--current-prompt-text))))
+         (prompt (string-trim-right (oc-hp-popup--current-prompt-text)))
+         (snapshot (list :text (buffer-substring (point-min) (point-max))
+                         :phase oc-hp-popup-phase
+                         :point (point)
+                         :modified (buffer-modified-p)
+                         :answer-end (and (markerp oc-hp-popup-answer-end)
+                                          (marker-position
+                                           oc-hp-popup-answer-end)))))
     (unless (and session-id directory)
       (user-error "Popup buffer has no session/directory attached"))
     (when (string-empty-p prompt)
@@ -282,7 +303,18 @@ Phase 1 (a turn still streaming) is refused to protect the display FSM."
           (message "OpenCode: prompt sent to session %s%s"
                    session-id (if follow-up-p " (follow-up)" "")))
       (error
-       (message "OpenCode: send failed: %s" (error-message-string err))))))
+       (let ((inhibit-read-only t))
+         (erase-buffer)
+         (insert (plist-get snapshot :text))
+         (setq-local oc-hp-popup-phase (plist-get snapshot :phase)
+                     buffer-read-only nil)
+         (setq-local oc-hp-popup-answer-end
+                     (when-let ((position (plist-get snapshot :answer-end)))
+                       (copy-marker position nil)))
+         (goto-char (min (plist-get snapshot :point) (point-max)))
+         (set-buffer-modified-p (plist-get snapshot :modified)))
+       (message "OpenCode: send failed; prompt restored: %s"
+                (error-message-string err))))))
 
 (defun oc-hp-popup--current-prompt-text ()
   "Return the current editable prompt text in the popup buffer.
@@ -398,7 +430,12 @@ and OpenCode session."
 
 (defun oc-hp-popup--make-frame ()
   "Create (or reuse) the popup frame and switch the current buffer into it."
-  (let* ((name oc-hp-popup-frame-title)
+  (let* ((old-addresses
+          (when (and oc-hp-popup-float-on-hyprland
+                     (eq window-system 'x)
+                     (executable-find "hyprctl"))
+            (oc-hp-popup--hyprland-client-addresses)))
+         (name oc-hp-popup-frame-title)
          (width oc-hp-popup-frame-width)
          (height oc-hp-popup-frame-height)
          (params `((name . ,name)
@@ -415,7 +452,7 @@ and OpenCode session."
          (frame (make-frame params)))
     (with-current-buffer (window-buffer (frame-root-window frame))
       (setq oc-hp-popup-frame frame))
-    (oc-hp-popup--hyprland-float frame)
+    (oc-hp-popup--hyprland-float frame old-addresses)
     (oc-hp-popup--resize-frame frame)
     (run-with-timer 0.15 nil #'oc-hp-popup--resize-frame frame)
     frame))
@@ -427,7 +464,7 @@ and OpenCode session."
                     oc-hp-popup-frame-width
                     oc-hp-popup-frame-height)))
 
-(defun oc-hp-popup--hyprland-float (frame)
+(defun oc-hp-popup--hyprland-float (frame &optional old-addresses)
   "Imperatively float FRAME on Hyprland if running under XWayland.
 Guarded so the no-op path is taken on pgtk / terminal Emacs (per
 RESEARCH §2 the build here is `window-system = x').
@@ -452,9 +489,17 @@ is a *different* namespace from Hyprland's internal address —
     (let ((default-directory (or default-directory "~/"))
           (title oc-hp-popup-frame-title))
       (condition-case err
-          (let ((address (oc-hp-popup--hyprland-address-for-title title)))
+          (let ((address
+                 (or (let ((saved (frame-parameter
+                                   frame 'oc-hp-hyprland-address)))
+                       (and saved
+                            (member saved (oc-hp-popup--hyprland-client-addresses))
+                            saved))
+                     (oc-hp-popup--hyprland-new-address title old-addresses)
+                     (oc-hp-popup--hyprland-address-for-title title))))
             (cond
              (address
+              (set-frame-parameter frame 'oc-hp-hyprland-address address)
               (call-process "hyprctl" nil 0 nil
                             "dispatch" "setfloating"
                             (concat "address:" address)))
@@ -469,6 +514,36 @@ matched title %S (it may appear shortly)" title))))
          (message "opencode popup: hyprctl float failed: %s"
                   (error-message-string err)))))))
 
+(defun oc-hp-popup--hyprland-clients ()
+  "Return Hyprland client plists, or nil when unavailable."
+  (condition-case nil
+      (with-temp-buffer
+        (when (zerop (call-process "hyprctl" nil t nil "clients" "-j"))
+          (let ((clients (oc-hp-popup--json-parse-plist-array
+                          (buffer-string))))
+            (and (listp clients) clients))))
+    (error nil)))
+
+(defun oc-hp-popup--hyprland-client-addresses ()
+  "Return all currently known Hyprland client addresses."
+  (delq nil (mapcar (lambda (client) (plist-get client :address))
+                    (oc-hp-popup--hyprland-clients))))
+
+(defun oc-hp-popup--hyprland-new-address (title old-addresses)
+  "Find TITLE's newly created address relative to OLD-ADDRESSES."
+  (when old-addresses
+    (let ((deadline (+ (float-time) 0.6)) found)
+      (while (and (not found) (< (float-time) deadline))
+        (setq found
+              (cl-loop for client in (oc-hp-popup--hyprland-clients)
+                       for address = (plist-get client :address)
+                       when (and address
+                                 (equal (plist-get client :title) title)
+                                 (not (member address old-addresses)))
+                       return address))
+        (unless found (accept-process-output nil 0.05)))
+      found)))
+
 (defun oc-hp-popup--hyprland-address-for-title (title)
   "Return the Hyprland window address whose title is TITLE, or nil.
 Reads `hyprctl clients -j' and matches the `title' field exactly.
@@ -480,13 +555,14 @@ focus-race-prone active-window dispatch."
       (with-temp-buffer
         (when (zerop (call-process "hyprctl" nil t nil "clients" "-j"))
           (goto-char (point-min))
-          (let ((clients (oc-hp-popup--json-parse-plist-array
-                          (buffer-string))))
-            (and (listp clients)
-                 (cl-some (lambda (c)
-                            (and (equal (plist-get c :title) title)
-                                 (plist-get c :address)))
-                          clients)))))
+          (let* ((clients (oc-hp-popup--json-parse-plist-array
+                           (buffer-string)))
+                 (matches
+                  (and (listp clients)
+                       (cl-loop for client in clients
+                                when (equal (plist-get client :title) title)
+                                collect (plist-get client :address)))))
+            (and (= (length matches) 1) (car matches)))))
     (error
      (message "opencode popup: hyprctl clients parse failed: %s"
               (error-message-string err))
@@ -718,7 +794,7 @@ Reuse BUF's existing live frame when present, including an invisible one."
       (select-frame frame)
       (select-window win)
       (with-current-buffer buf
-        (goto-char (point-min))
+        (goto-char (point-max))
         ;; give buffer its own modeline indicator
         (setq mode-line-format
               '("OC-Prompt  session: " (:eval (or oc-hp-popup-session-id "?"))
